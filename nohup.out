@@ -1,0 +1,24 @@
+Traceback (most recent call last):
+  File "/home/wanqing.yu/anaconda3/envs/AC/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/home/wanqing.yu/anaconda3/envs/AC/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/home/wanqing.yu/anaconda3/envs/AC/lib/python3.10/site-packages/neuroglancer/tool/video_tool.py", line 665, in <module>
+    args.func(args)
+  File "/home/wanqing.yu/anaconda3/envs/AC/lib/python3.10/site-packages/neuroglancer/tool/video_tool.py", line 538, in run_render
+    keypoints = load_script(args.script)
+  File "/home/wanqing.yu/anaconda3/envs/AC/lib/python3.10/site-packages/neuroglancer/tool/video_tool.py", line 250, in load_script
+    with open(script_path) as f:
+FileNotFoundError: [Errno 2] No such file or directory: 'video_test.txt'
+Traceback (most recent call last):
+  File "/home/wanqing.yu/anaconda3/envs/AC/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/home/wanqing.yu/anaconda3/envs/AC/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/home/wanqing.yu/anaconda3/envs/AC/lib/python3.10/site-packages/neuroglancer/tool/video_tool.py", line 665, in <module>
+    args.func(args)
+  File "/home/wanqing.yu/anaconda3/envs/AC/lib/python3.10/site-packages/neuroglancer/tool/video_tool.py", line 538, in run_render
+    keypoints = load_script(args.script)
+  File "/home/wanqing.yu/anaconda3/envs/AC/lib/python3.10/site-packages/neuroglancer/tool/video_tool.py", line 250, in load_script
+    with open(script_path) as f:
+FileNotFoundError: [Errno 2] No such file or directory: 'video_test.txt'
