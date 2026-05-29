@@ -26,6 +26,56 @@ import numpy as np
 # --------------------------------------------------------------------------- #
 # Stateless tween helpers
 # --------------------------------------------------------------------------- #
+def _slerp(q0, q1, t: float) -> np.ndarray:
+    """Spherical-linear interpolation of two quaternions ``[x, y, z, w]``."""
+    q0 = np.asarray(q0, dtype=float)
+    q1 = np.asarray(q1, dtype=float)
+    d = float(np.dot(q0, q1))
+    if d < 0.0:  # take the shorter arc
+        q1, d = -q1, -d
+    if d > 0.9995:  # nearly identical -> linear
+        q = q0 + t * (q1 - q0)
+        return q / np.linalg.norm(q)
+    theta0 = np.arccos(d)
+    q2 = q1 - q0 * d
+    q2 = q2 / np.linalg.norm(q2)
+    return q0 * np.cos(theta0 * t) + q2 * np.sin(theta0 * t)
+
+
+def _interpolate_nav(initial, final, t: float):
+    """Intermediate state tweening **navigation only** (position/orientation/zoom).
+
+    Deep-copies ``final`` (so layers/dimensions are kept verbatim) and overwrites just
+    the camera fields, then ``set_state`` pushes it. Smoother than per-frame ``txn``
+    mutation, and avoids ``neuroglancer.ViewerState.interpolate`` (which crashes on
+    ImageLayer in 2.41.2).
+    """
+    s = copy.deepcopy(final)
+    try:
+        a = np.asarray(initial.voxel_coordinates, dtype=float)
+        b = np.asarray(final.voxel_coordinates, dtype=float)
+        if a.shape == b.shape:
+            s.voxel_coordinates = a + (b - a) * t
+    except Exception:
+        pass
+    for attr in ("crossSectionOrientation", "projectionOrientation"):
+        try:
+            q0 = getattr(initial, attr, None)
+            q1 = getattr(final, attr, None)
+            if q0 is not None and q1 is not None:
+                setattr(s, attr, _slerp(q0, q1, t))
+        except Exception:
+            pass
+    try:
+        v0 = getattr(initial, "cross_section_scale", None)
+        v1 = getattr(final, "cross_section_scale", None)
+        if v0 and v1:  # log-lerp so zoom feels uniform
+            s.cross_section_scale = float(np.exp(np.log(v0) + (np.log(v1) - np.log(v0)) * t))
+    except Exception:
+        pass
+    return s
+
+
 def interpolate_to(
     viewer: neuroglancer.Viewer,
     final_state: neuroglancer.ViewerState,
@@ -33,11 +83,10 @@ def interpolate_to(
     seconds: float = 1.0,
     should_continue: Optional[Callable[[], bool]] = None,
 ) -> None:
-    """Smoothly tween from the current viewer state to ``final_state``.
+    """Smoothly tween the camera (navigation only) to ``final_state``.
 
-    ``should_continue`` is checked before every frame; returning ``False`` aborts
-    the tween early (used by :class:`FlyThrough` to make stop/pause responsive
-    mid-transition).
+    ``should_continue`` is checked before every frame; returning ``False`` aborts the
+    tween early (used by :class:`FlyThrough` to make stop/pause responsive mid-transition).
     """
     total_frames = max(1, int(round(seconds * frames_per_second)))
     initial_state = viewer.state
@@ -45,9 +94,7 @@ def interpolate_to(
         if should_continue is not None and not should_continue():
             return
         t = frame_i / total_frames
-        viewer.set_state(
-            neuroglancer.ViewerState.interpolate(initial_state, final_state, t)
-        )
+        viewer.set_state(_interpolate_nav(initial_state, final_state, t))
         time.sleep(1 / frames_per_second)
     if should_continue is None or should_continue():
         viewer.set_state(final_state)
@@ -110,6 +157,12 @@ class FlyThrough:
     on_index_change:
         Optional callback ``f(index)`` fired (from the worker thread) whenever the
         current node changes -- the UI uses this to keep its progress slider in sync.
+    settle:
+        Optional callable invoked (in the worker) after arriving at each autoplay
+        node, before advancing. Use it to **load-gate** playback -- e.g. block until
+        the viewer has finished streaming the current frame -- so a fly-through over
+        slow-loading data stays sharp instead of outrunning the tiles. Should be
+        self-bounded (use a timeout) so it can't stall the worker forever.
 
     The controller is driven entirely by flipping thread-safe state, so button
     callbacks return instantly and never block the kernel.
@@ -123,6 +176,9 @@ class FlyThrough:
         seconds_per_step: float = 0.3,
         frames_per_second: float = 30,
         on_index_change: Optional[Callable[[int], None]] = None,
+        settle: Optional[Callable[[], None]] = None,
+        animate: bool = True,
+        dwell_seconds: float = 0.0,
     ):
         self.viewer = viewer
         self.positions = np.asarray(positions, dtype=float)
@@ -135,6 +191,14 @@ class FlyThrough:
         self.seconds_per_step = seconds_per_step
         self.frames_per_second = frames_per_second
         self.on_index_change = on_index_change
+        self.settle = settle
+        # animate=True tweens between nodes (smooth, but intermediate frames stream in
+        # coarse); animate=False jump-cuts. Either way, dwell_seconds is a rest *at* each
+        # node during autoplay so a slow overlay (e.g. EM segmentation) can load and be
+        # seen without the user having to pause. (animate jump-cut with dwell_seconds=0
+        # falls back to dwelling seconds_per_step so it doesn't race.)
+        self.animate = animate
+        self.dwell_seconds = dwell_seconds
 
         self._index = 0
         self._direction = 1  # +1 forward, -1 reverse
@@ -210,7 +274,7 @@ class FlyThrough:
         with self._lock:
             target = self._index + (1 if direction >= 0 else -1)
             target = max(0, min(self.n_nodes - 1, target))
-        self._goto(target, animate=True)
+        self._goto(target, animate=self.animate)
         self._set_index(target)
 
     def seek(self, index: int, animate: bool = True) -> None:
@@ -268,7 +332,28 @@ class FlyThrough:
                 self._play.clear()
                 continue
 
-            self._goto(nxt, animate=True)
+            self._goto(nxt, animate=self.animate)
             if self._stop.is_set():
                 break
             self._set_index(nxt)
+
+            # settle hook (e.g. prefetch upcoming nodes / load-gate the frame).
+            if self.settle is not None and not self._stop.is_set():
+                try:
+                    self.settle()
+                except Exception:
+                    pass
+
+            # rest at the node (interruptibly) so its frame can finish loading and be
+            # seen -- in both modes. Jump-cut with no explicit dwell falls back to
+            # seconds_per_step so it doesn't advance instantly.
+            dwell = self.dwell_seconds
+            if not self.animate and dwell <= 0:
+                dwell = self.seconds_per_step
+            if dwell > 0:
+                self._sleep_interruptible(dwell)
+
+    def _sleep_interruptible(self, seconds: float) -> None:
+        end = time.time() + max(0.0, seconds)
+        while time.time() < end and not self._stop.is_set():
+            time.sleep(min(0.05, end - time.time()))

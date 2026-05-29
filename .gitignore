@@ -7,3 +7,6 @@ __pycache__/
 *.pyc
 .venv/
 .ipynb_checkpoints/
+
+# proofreading session write-ahead logs (annotation data, not code)
+proofread_sessions/

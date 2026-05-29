@@ -26,6 +26,11 @@ try:  # EMClient needs the `em` extra (caveclient + cloud-volume)
 except ImportError:  # pragma: no cover
     EMClient = None
 
+try:  # the interactive session needs neuroglancer (core dep)
+    from .annotator import ProofreadSession
+except ImportError:  # pragma: no cover
+    ProofreadSession = None
+
 __all__ = [
     "SkeletonTree",
     "BranchPath",
@@ -39,4 +44,5 @@ __all__ = [
     "Coverage",
     "PathState",
     "EMClient",
+    "ProofreadSession",
 ]
