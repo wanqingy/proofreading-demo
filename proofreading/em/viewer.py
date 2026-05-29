@@ -30,6 +30,9 @@ TAG_COLORS = {
 PATH_LAYER = "branch_path"
 IMAGE_LAYER = "img"
 SEG_LAYER = "seg"
+# local precomputed fly-through preview (renders during motion; see preview.py)
+PREVIEW_EM = "preview_em"
+PREVIEW_TGT = "preview_target"
 
 
 def ann_layer(tag: str) -> str:
@@ -148,9 +151,15 @@ def remove_point(viewer: neuroglancer.Viewer, tag: str, ann_id: str) -> None:
 def show_branch_path(viewer: neuroglancer.Viewer, points_voxel: np.ndarray) -> None:
     """Draw the current branch path as a polyline (viewer voxel coords)."""
     pts = np.asarray(points_voxel, dtype=float)
+    # plain python floats: numpy floats don't serialize cleanly and leave the
+    # annotation position undefined in the browser (neuroglancer then throws
+    # "Cannot set properties of undefined (setting 'localPositionValid')" on every
+    # pick/frame, which also janks playback).
     lines = [
         neuroglancer.LineAnnotation(
-            id=f"seg{i}", point_a=list(pts[i]), point_b=list(pts[i + 1])
+            id=f"seg{i}",
+            point_a=[float(c) for c in pts[i]],
+            point_b=[float(c) for c in pts[i + 1]],
         )
         for i in range(len(pts) - 1)
     ]
@@ -161,6 +170,25 @@ def show_branch_path(viewer: neuroglancer.Viewer, points_voxel: np.ndarray) -> N
 def set_segments(viewer: neuroglancer.Viewer, segment_ids) -> None:
     with viewer.txn() as s:
         s.layers[SEG_LAYER].segments = [int(x) for x in segment_ids]
+
+
+def set_preview_mode(viewer: neuroglancer.Viewer, on: bool) -> None:
+    """Flip between the local **preview** layers and the **live** layers.
+
+    ``on=True`` (the camera is gliding): show the precomputed local EM + target overlay
+    (they render during motion) and hide the live EM/seg (which can't keep up / only
+    paint when idle). ``on=False`` (paused): hide the preview and show the live layers, so
+    the full-resolution EM and the real graphene segmentation paint at the current spot
+    for inspection + annotation. Missing layers are ignored (preview may not exist yet).
+    """
+    on = bool(on)
+    with viewer.txn() as s:
+        for name in (PREVIEW_EM, PREVIEW_TGT):
+            if name in s.layers:
+                s.layers[name].visible = on
+        for name in (IMAGE_LAYER, SEG_LAYER):
+            if name in s.layers:
+                s.layers[name].visible = not on
 
 
 def set_prefetch(viewer: neuroglancer.Viewer, nav_list) -> None:

@@ -16,16 +16,21 @@ in the WAL immediately; the neuroglancer layers and coverage are views of it.
 
 from __future__ import annotations
 
+import copy
+import os
 from typing import Optional
 
 import numpy as np
 
 from . import path as P
+from . import preview as PV
+from . import render as R
 from . import viewer as V
 from .coverage import Coverage, PathState
+from .review import BranchPlayer
 from .skeleton_tree import SkeletonTree
 from .wal import WAL, TAGS
-from ..flythrough import FlyThrough
+from ..flythrough import FlyThrough, build_target_state
 
 # neuroglancer key name -> tag
 TAG_KEYS = {
@@ -52,9 +57,12 @@ class ProofreadSession:
         animate: bool = True,
         dwell_seconds: float = 1.5,
         orient_to_path: bool = False,
+        preview_target_nm: float = 256.0,
+        preview_pad_nm: float = 1500.0,
+        preview_max_voxels: int = 25_000_000,
         load_gated: bool = False,
         load_timeout: float = 15.0,
-        prefetch_window: int = 3,
+        prefetch_window: int = 0,
         cross_section_render_scale: float = 1.0,
         gpu_memory_limit: int = 2_000_000_000,
         system_memory_limit: int = 4_000_000_000,
@@ -79,9 +87,17 @@ class ProofreadSession:
         # manual scrolling); True tilts panel 1 to a cross-section ⊥ the neurite (nicer for
         # judging merges, but oblique slices are slower to stream).
         self.orient_to_path = orient_to_path
+        # preview glide (default review): a precomputed local EM+target layer at ~target_nm
+        # over the branch bbox (+pad), so the camera can glide smoothly with the target
+        # visible; pausing reveals the live img+seg for annotation. See preview.py.
+        self.preview_target_nm = float(preview_target_nm)
+        self.preview_pad_nm = float(preview_pad_nm)
+        self.preview_max_voxels = int(preview_max_voxels)
+        self._preview = None
         self.load_gated = load_gated
         self.load_timeout = load_timeout
-        # prefetch: warm the next N nodes (both directions) so frames are ready on arrival.
+        # prefetch (opt-in, default off): warm the next N nodes by injecting extra full
+        # ViewerStates for the browser to render -- can add jank, so off unless you want it.
         self.prefetch_window = int(prefetch_window)
         self._fly_pos_vox = None
         self._fly_quats = None
@@ -95,6 +111,8 @@ class ProofreadSession:
         # durable state (resumes a prior log for this cell, keyed by seed supervoxel)
         self.wal = WAL.for_cell(wal_dir, emclient.datastack, self.seed)
         self.coverage = Coverage.from_wal_state(WAL.load(self.wal.path))
+        # pre-rendered fly-through frames, keyed by the (geometry-specific) root id
+        self.render_dir = os.path.join(wal_dir, "renders", emclient.datastack, str(self.root_id))
 
         # viewer
         self.viewer, self.res, self.dims = V.make_em_viewer(
@@ -114,10 +132,13 @@ class ProofreadSession:
     # ------------------------------------------------------------------ #
     # navigation
     # ------------------------------------------------------------------ #
-    def review_path(self, path_id: int) -> FlyThrough:
-        """Load a branch path's camera path and start a (paused) fly-through."""
+    def _compute_path(self, path_id: int):
+        """Resample a branch path -> ``(verts_nm, positions_nm, positions_vox, quats)``.
+
+        ``quats`` is ``None`` unless ``orient_to_path`` (then a per-node cross-section ⊥
+        the neurite). Shared by the live fly-through, the pre-render, and ``goto_node``.
+        """
         bp = self.tree.branch_paths[int(path_id)]
-        self.current_path_id = int(path_id)
         verts_nm = self.tree.vertices[bp.vertices]
         rs = P.resample_path(verts_nm, self.step_nm)
         if self.orient_to_path:
@@ -125,22 +146,64 @@ class ProofreadSession:
             quats = P.frame_to_quaternion(T, N, B)
         else:
             quats = None  # keep the native axis-aligned sections (just move position)
+        return verts_nm, rs, rs / self.res, quats
+
+    def review_path(self, path_id: int, preview: bool = True) -> FlyThrough:
+        """Load a branch path's camera path and start a (paused) fly-through.
+
+        ``preview=True`` (default) builds a precomputed local EM+target layer for the branch
+        and glides over it **continuously** (no per-node rest): the target is visible while
+        moving, and pausing flips to the live ``img``+``seg`` for annotation (the dwell is
+        gone -- it only existed so the live seg could paint). ``preview=False`` is the old
+        live-glide fallback (rest at each node so the live seg paints during the rest).
+        """
+        self.current_path_id = int(path_id)
+        verts_nm, rs, pos_vox, quats = self._compute_path(path_id)
         self._positions_nm = rs
-        self._fly_pos_vox = rs / self.res  # for prefetch
+        self._fly_pos_vox = pos_vox  # for prefetch
         self._fly_quats = quats
 
         V.show_branch_path(self.viewer, verts_nm / self.res)
         if self.fly is not None:
             self.fly.stop()
+
+        on_play = on_pause = settle = None
+        dwell = self.dwell_seconds
+        PV.remove_preview_layers(self.viewer)
+        self._preview = None
+        if preview:
+            try:
+                self._preview = PV.build_preview(
+                    self.client, rs, self.root_id,
+                    target_nm=self.preview_target_nm, pad_nm=self.preview_pad_nm,
+                    max_voxels=self.preview_max_voxels,
+                )
+                PV.add_preview_layers(self.viewer, self._preview, visible=False)
+                # continuous glide over the local preview; swap to live layers on pause
+                dwell = 0.0
+                settle = None
+                on_play = lambda: V.set_preview_mode(self.viewer, True)
+                on_pause = lambda: V.set_preview_mode(self.viewer, False)
+            except Exception as exc:  # no token / out of bounds / etc. -> live-glide fallback
+                import warnings
+
+                warnings.warn(f"preview build failed, falling back to live glide: {exc!r}")
+                self._preview = None
+        if self._preview is None:  # live-glide fallback (rest at each node)
+            settle = self._make_settle()
+        V.set_preview_mode(self.viewer, False)  # start paused -> live layers shown
+
         self.fly = FlyThrough(
             self.viewer,
             rs / self.res,  # nm -> viewer voxels
             quats,
             seconds_per_step=self.seconds_per_step,
             frames_per_second=self.frames_per_second,
-            settle=self._make_settle(),
+            settle=settle,
             animate=self.animate,
-            dwell_seconds=self.dwell_seconds,
+            dwell_seconds=dwell,
+            on_play=on_play,
+            on_pause=on_pause,
         )
         self.fly.start()
         return self.fly
@@ -218,6 +281,135 @@ class ProofreadSession:
         """Jump to the next branch path still ``to_review``."""
         todo = self.coverage.to_review(self.tree)
         return self.review_path(todo[0]) if todo else None
+
+    # ------------------------------------------------------------------ #
+    # pre-render -> review -> act (the default Phase A loop)
+    # ------------------------------------------------------------------ #
+    def _branch_render_dir(self, path_id: int) -> str:
+        return os.path.join(self.render_dir, f"path_{int(path_id)}")
+
+    def _progress_printer(self, path_id: int):
+        def cb(done: int, total: int, captured: bool) -> None:
+            miss = "" if captured else "  (no capture!)"
+            end = "\n" if done == total else "\r"
+            print(f"  path {path_id}: rendered {done}/{total}{miss}", end=end, flush=True)
+
+        return cb
+
+    def prerender_branch(
+        self,
+        path_id: int,
+        *,
+        size=(900, 900),
+        render_layout: Optional[str] = "xy",
+        load_timeout: Optional[float] = None,
+        settle: float = 0.0,
+        show_path: bool = True,
+        force: bool = False,
+        on_progress="print",
+    ) -> dict:
+        """Capture one fully-loaded frame per node along a branch (the slow batch step).
+
+        Drives the live viewer node-by-node, waiting for each frame to fully render (so
+        the segmentation is painted) before screenshotting. ``render_layout="xy"`` renders
+        a single 2D cross-section so the load-gate only waits on the fast EM+seg tiles, not
+        the slow 3D mesh; pass ``None`` to capture the current layout as-is. Re-running is a
+        no-op unless ``force`` (already-rendered branches are skipped).
+
+        Requires the viewer open in a browser. Returns the manifest dict.
+        """
+        verts_nm, pos_nm, pos_vox, quats = self._compute_path(path_id)
+        nav = [(pos_vox[i], None if quats is None else quats[i]) for i in range(len(pos_vox))]
+        meta = [
+            {"node_index": int(i), "xyz_nm": [float(c) for c in pos_nm[i]]}
+            for i in range(len(pos_nm))
+        ]
+        if show_path:
+            V.show_branch_path(self.viewer, verts_nm / self.res)
+
+        prev_layout = None
+        if render_layout is not None:
+            prev_layout = copy.deepcopy(self.viewer.state.layout)
+            with self.viewer.txn() as s:
+                s.layout = render_layout
+
+        cb = self._progress_printer(path_id) if on_progress == "print" else on_progress
+        try:
+            return R.render_states(
+                self.viewer,
+                nav,
+                self._branch_render_dir(path_id),
+                size=size,
+                load_timeout=self.load_timeout if load_timeout is None else load_timeout,
+                settle=settle,
+                meta=meta,
+                extra_manifest={
+                    "root_id": self.root_id,
+                    "path_id": int(path_id),
+                    "orient_to_path": bool(self.orient_to_path),
+                    "step_nm": self.step_nm,
+                },
+                on_progress=cb,
+                force=force,
+            )
+        finally:
+            if prev_layout is not None:
+                with self.viewer.txn() as s:
+                    s.layout = prev_layout
+
+    def prerender_all(self, **kw) -> dict:
+        """Pre-render every branch still ``to_review`` (resumable: skips done ones)."""
+        todo = self.coverage.to_review(self.tree)
+        out = {}
+        for k, pid in enumerate(todo):
+            print(f"=== prerender path {pid} ({k + 1}/{len(todo)}) ===")
+            out[pid] = self.prerender_branch(pid, **kw)
+        return out
+
+    def review_branch(
+        self,
+        path_id: int,
+        *,
+        fps: int = 10,
+        max_width: Optional[int] = 700,
+        render_if_missing: bool = True,
+        **render_kw,
+    ) -> BranchPlayer:
+        """Show the smooth frame player for a branch; "→ viewer" jumps the live viewer.
+
+        Renders the branch first if needed (``render_if_missing``). The player scrubs the
+        pre-rendered frames (seg visible in every frame); clicking "→ viewer" calls
+        :meth:`goto_node` so you can drop the annotation at that exact node.
+        """
+        out_dir = self._branch_render_dir(path_id)
+        try:
+            manifest = R.load_branch_frames(out_dir)
+        except FileNotFoundError:
+            if not render_if_missing:
+                raise
+            manifest = self.prerender_branch(path_id, **render_kw)
+        self.current_path_id = int(path_id)
+        player = BranchPlayer(
+            manifest,
+            on_goto=lambda ni, xyz, pid=int(path_id): self.goto_node(pid, ni, xyz),
+            fps=fps,
+            max_width=max_width,
+        )
+        player.show()
+        return player
+
+    def goto_node(self, path_id: int, node_index: int, xyz_nm=None) -> int:
+        """Jump the **live** viewer to a node on a branch (so you can annotate there)."""
+        verts_nm, pos_nm, pos_vox, quats = self._compute_path(path_id)
+        self.current_path_id = int(path_id)
+        self._positions_nm = pos_nm
+        self._fly_pos_vox = pos_vox
+        self._fly_quats = quats
+        i = max(0, min(len(pos_vox) - 1, int(node_index)))
+        V.show_branch_path(self.viewer, verts_nm / self.res)
+        ori = None if quats is None else quats[i]
+        self.viewer.set_state(build_target_state(self.viewer, pos_vox[i], ori))
+        return i
 
     # ------------------------------------------------------------------ #
     # key bindings

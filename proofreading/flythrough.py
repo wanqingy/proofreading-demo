@@ -179,6 +179,8 @@ class FlyThrough:
         settle: Optional[Callable[[], None]] = None,
         animate: bool = True,
         dwell_seconds: float = 0.0,
+        on_play: Optional[Callable[[], None]] = None,
+        on_pause: Optional[Callable[[], None]] = None,
     ):
         self.viewer = viewer
         self.positions = np.asarray(positions, dtype=float)
@@ -192,6 +194,10 @@ class FlyThrough:
         self.frames_per_second = frames_per_second
         self.on_index_change = on_index_change
         self.settle = settle
+        # fired (best-effort) when autoplay starts / stops -- used to swap a local preview
+        # layer (visible while moving) for the live layers (shown when idle / paused).
+        self.on_play = on_play
+        self.on_pause = on_pause
         # animate=True tweens between nodes (smooth, but intermediate frames stream in
         # coarse); animate=False jump-cuts. Either way, dwell_seconds is a rest *at* each
         # node during autoplay so a slow overlay (e.g. EM segmentation) can load and be
@@ -248,10 +254,21 @@ class FlyThrough:
         if self._thread is None or not self._thread.is_alive():
             self.start()
         self._play.set()
+        self._fire(self.on_play)
 
     def pause(self) -> None:
         """Pause autoplay (worker stops at the end of the current transition)."""
         self._play.clear()
+        self._fire(self.on_pause)
+
+    @staticmethod
+    def _fire(cb: Optional[Callable[[], None]]) -> None:
+        """Invoke a play/pause hook, swallowing errors (never disturb playback)."""
+        if cb is not None:
+            try:
+                cb()
+            except Exception:
+                pass
 
     def toggle(self) -> None:
         self.pause() if self.is_playing else self.play()
@@ -330,6 +347,7 @@ class FlyThrough:
             if nxt < 0 or nxt >= self.n_nodes:
                 # Hit an end -- pause and wait for the user to change direction.
                 self._play.clear()
+                self._fire(self.on_pause)  # reveal live layers at the end node too
                 continue
 
             self._goto(nxt, animate=self.animate)

@@ -33,6 +33,8 @@ class EMClient:
         )
         self._seg = None
         self._res = None
+        self._img_cvs: dict = {}  # mip -> image CloudVolume
+        self._agg_cvs: dict = {}  # mip -> agglomerated segmentation CloudVolume
 
     @property
     def mat_version(self) -> int:
@@ -54,6 +56,40 @@ class EMClient:
         """mip0 voxel size in nm (e.g. [8, 8, 40] for minnie65)."""
         _ = self.seg
         return self._res
+
+    def agg_seg_cv(self, mip: int = 0):
+        """Agglomerated segmentation CloudVolume at ``mip`` (root ids, not supervoxels; cached).
+
+        Used to build the per-branch target mask for the local fly-through preview
+        (``mask = cutout == root_id``). Distinct from :attr:`seg` (agglomerate=False).
+        """
+        mip = int(mip)
+        cv = self._agg_cvs.get(mip)
+        if cv is None:
+            cv = self.client.info.segmentation_cloudvolume(
+                agglomerate=True, mip=mip, progress=False
+            )
+            self._agg_cvs[mip] = cv
+        return cv
+
+    def image_cloudvolume(self, mip: int = 0):
+        """EM image CloudVolume at ``mip`` (cached per mip).
+
+        Unlike the segmentation, the imagery was previously only used as a source
+        *string* in the browser; this is the first direct (python-side) cutout source.
+        """
+        mip = int(mip)
+        cv = self._img_cvs.get(mip)
+        if cv is None:
+            cv = self.client.info.image_cloudvolume(mip=mip, progress=False)
+            self._img_cvs[mip] = cv
+        return cv
+
+    def mip_near(self, cv, target_nm: float) -> int:
+        """Pick the CloudVolume mip whose in-plane (x) resolution is closest to ``target_nm``."""
+        mips = list(cv.available_mips)
+        xy = [float(np.asarray(cv.mip_resolution(m))[0]) for m in mips]
+        return int(mips[int(np.argmin([abs(x - float(target_nm)) for x in xy]))])
 
     # ----- skeletons ----------------------------------------------------- #
     def get_skeleton(self, root_id: int, skeleton_version: int = 4) -> dict:

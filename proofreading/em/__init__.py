@@ -26,10 +26,18 @@ try:  # EMClient needs the `em` extra (caveclient + cloud-volume)
 except ImportError:  # pragma: no cover
     EMClient = None
 
-try:  # the interactive session needs neuroglancer (core dep)
+try:  # the interactive session + preview/pre-render need neuroglancer (core dep)
     from .annotator import ProofreadSession
+    from .preview import build_preview, add_preview_layers, remove_preview_layers, localvolume_spike
+    from .tube import tube_prototype, build_local_tube, serve_dir, tube_chunks
+    from .render import render_states, load_branch_frames, encode_video
+    from .review import BranchPlayer
 except ImportError:  # pragma: no cover
     ProofreadSession = None
+    build_preview = add_preview_layers = remove_preview_layers = localvolume_spike = None
+    tube_prototype = build_local_tube = serve_dir = tube_chunks = None
+    render_states = load_branch_frames = encode_video = None
+    BranchPlayer = None
 
 __all__ = [
     "SkeletonTree",
@@ -45,4 +53,16 @@ __all__ = [
     "PathState",
     "EMClient",
     "ProofreadSession",
+    "build_preview",
+    "add_preview_layers",
+    "remove_preview_layers",
+    "localvolume_spike",
+    "tube_prototype",
+    "build_local_tube",
+    "serve_dir",
+    "tube_chunks",
+    "render_states",
+    "load_branch_frames",
+    "encode_video",
+    "BranchPlayer",
 ]
