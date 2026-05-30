@@ -1,6 +1,6 @@
 # EM proofreading workflow — design & v1 plan
 
-_Last updated: 2026-05-28. Vocabulary in [../CONTEXT.md](../CONTEXT.md); decision
+_Last updated: 2026-05-29. Vocabulary in [../CONTEXT.md](../CONTEXT.md); decision
 records in [adr/](adr/). Builds on the [`proofreading/`](../proofreading/) package
 (`FlyThrough`, `FlyThroughControls`)._
 
@@ -10,6 +10,33 @@ Drive a skeleton fly-through of an EM cell (MICrONS minnie65) from the
 **neuroglancer python API** so a human can review the whole cell and lay down
 **typed annotations** marking proofreading errors. The annotations ultimately
 feed chunkedgraph **edits** — but in v1 the editing is a separate, manual step.
+
+## Known limitation & next architecture (2026-05-29)
+
+Driving the review from the **neuroglancer python API** mirrors the full viewer state to the
+browser on every change, and that **degrades the longer a session runs**: the fly-through
+`copy.deepcopy`s and `set_state`s the *entire* viewer state ~30×/s
+([../proofreading/flythrough.py](../proofreading/flythrough.py) `_interpolate_nav` /
+`interpolate_to`), so per-frame cost grows with accumulated annotations/layers, and the
+browser accumulates the pushed state + chunk/GPU memory (reopening the tab restores speed).
+
+The smooth-glide *rendering* bottleneck (neuroglancer only paints the seg when idle; EM blurs
+in motion) was solved with a **sparse-tube local precomputed layer** at mip1, served to
+neuroglancer (`proofreading/em/tube.py` `CellTube` — one shared per-cell volume filled lazily
+per branch). But the **interaction model itself** (per-frame python → browser) is the
+remaining ceiling.
+
+**Chosen direction (deferred):** for a shared/maintained tool with an essential auto-glide,
+move the interaction into the browser — embed neuroglancer directly and animate its
+**`navigationState` client-side** (no per-frame python), with the Python/CAVE engine
+(`proofreading/em`) as a **data backend** (FastAPI serving the tube precomputed + camera
+paths, recording annotations to the WAL). De-risk the low-level `navigationState.pose`
+`requestAnimationFrame` camera loop with a spike first (the state-prop `react-neuroglancer`
+wrapper is too coarse for per-frame animation).
+
+**Cheap interim** (to keep the notebook usable meanwhile): drop the per-frame full-state
+deepcopy in `flythrough._interpolate_nav` (precompute per-node nav states / mutate only the
+camera fields) and keep annotations out of the animated state.
 
 ## Inputs
 

@@ -29,13 +29,17 @@ except ImportError:  # pragma: no cover
 try:  # the interactive session + preview/pre-render need neuroglancer (core dep)
     from .annotator import ProofreadSession
     from .preview import build_preview, add_preview_layers, remove_preview_layers, localvolume_spike
-    from .tube import tube_prototype, build_local_tube, serve_dir, tube_chunks
+    from .tube import (
+        tube_prototype, build_branch_tube, build_local_tube, build_local_volume,
+        add_tube_layers, serve_dir, tube_chunks, CellTube,
+    )
     from .render import render_states, load_branch_frames, encode_video
     from .review import BranchPlayer
 except ImportError:  # pragma: no cover
     ProofreadSession = None
     build_preview = add_preview_layers = remove_preview_layers = localvolume_spike = None
-    tube_prototype = build_local_tube = serve_dir = tube_chunks = None
+    tube_prototype = build_branch_tube = build_local_tube = build_local_volume = None
+    add_tube_layers = serve_dir = tube_chunks = CellTube = None
     render_states = load_branch_frames = encode_video = None
     BranchPlayer = None
 
@@ -58,7 +62,10 @@ __all__ = [
     "remove_preview_layers",
     "localvolume_spike",
     "tube_prototype",
+    "build_branch_tube",
     "build_local_tube",
+    "build_local_volume",
+    "add_tube_layers",
     "serve_dir",
     "tube_chunks",
     "render_states",

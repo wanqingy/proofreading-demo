@@ -25,6 +25,7 @@ import numpy as np
 from . import path as P
 from . import preview as PV
 from . import render as R
+from . import tube as T
 from . import viewer as V
 from .coverage import Coverage, PathState
 from .review import BranchPlayer
@@ -57,6 +58,8 @@ class ProofreadSession:
         animate: bool = True,
         dwell_seconds: float = 1.5,
         orient_to_path: bool = False,
+        tube_mip: int = 1,
+        tube_radius_nm: float = 1000.0,
         preview_target_nm: float = 256.0,
         preview_pad_nm: float = 1500.0,
         preview_max_voxels: int = 25_000_000,
@@ -87,7 +90,15 @@ class ProofreadSession:
         # manual scrolling); True tilts panel 1 to a cross-section ⊥ the neurite (nicer for
         # judging merges, but oblique slices are slower to stream).
         self.orient_to_path = orient_to_path
-        # preview glide (default review): a precomputed local EM+target layer at ~target_nm
+        # tube glide (DEFAULT review): a sparse local precomputed EM+target along the branch
+        # (only the chunks within tube_radius_nm of the skeleton), served to neuroglancer and
+        # rendered sharp at mip1 *during motion*; pause flips to the live img+seg. See tube.py.
+        self.tube_mip = int(tube_mip)
+        self.tube_radius_nm = float(tube_radius_nm)
+        self.tube_cache_dir = os.path.join(wal_dir, "tube_cache", emclient.datastack, str(self.root_id))
+        self._tube = None              # CellTube: ONE shared per-cell precomputed, filled lazily
+        self._tube_layers_added = False  # the single persistent tube layer pair (never swapped)
+        # in-memory coarse preview glide (mode='preview' fallback): a precomputed local layer at ~target_nm
         # over the branch bbox (+pad), so the camera can glide smoothly with the target
         # visible; pausing reveals the live img+seg for annotation. See preview.py.
         self.preview_target_nm = float(preview_target_nm)
@@ -126,6 +137,8 @@ class ProofreadSession:
         self.fly: Optional[FlyThrough] = None
         self.current_path_id: Optional[int] = None
         self._positions_nm: Optional[np.ndarray] = None
+        self._controls = None  # FlyThroughControls shown by panel() (rebuilt per branch)
+        self._on_fly_change = None  # panel() sets this; review_path fires it when self.fly changes
 
         self._bind_keys()
 
@@ -148,14 +161,18 @@ class ProofreadSession:
             quats = None  # keep the native axis-aligned sections (just move position)
         return verts_nm, rs, rs / self.res, quats
 
-    def review_path(self, path_id: int, preview: bool = True) -> FlyThrough:
+    def review_path(self, path_id: int, mode: str = "tube") -> FlyThrough:
         """Load a branch path's camera path and start a (paused) fly-through.
 
-        ``preview=True`` (default) builds a precomputed local EM+target layer for the branch
-        and glides over it **continuously** (no per-node rest): the target is visible while
-        moving, and pausing flips to the live ``img``+``seg`` for annotation (the dwell is
-        gone -- it only existed so the live seg could paint). ``preview=False`` is the old
-        live-glide fallback (rest at each node so the live seg paints during the rest).
+        ``mode``:
+          - ``"tube"`` (default): a **sparse local precomputed** EM+target tube at mip1 along
+            the branch (only the chunks within ``tube_radius_nm`` of the skeleton), served to
+            neuroglancer. Sharp continuous glide (``dwell=0``); the target is baked in; pausing
+            flips to the live ``img``+``seg`` to annotate. Per-branch result is cached, so
+            revisiting is instant.
+          - ``"preview"``: an in-memory coarse local preview (cheaper on disk, blockier).
+          - ``"live"``: no precompute -- the old live glide with a rest at each node so the
+            live seg paints (can't show seg while moving).
         """
         self.current_path_id = int(path_id)
         verts_nm, rs, pos_vox, quats = self._compute_path(path_id)
@@ -169,9 +186,26 @@ class ProofreadSession:
 
         on_play = on_pause = settle = None
         dwell = self.dwell_seconds
-        PV.remove_preview_layers(self.viewer)
         self._preview = None
-        if preview:
+
+        if mode == "tube":
+            try:
+                self._ensure_tube_layers()              # ONE shared per-cell volume + persistent layers
+                self._tube.fill_branch(path_id, verts_nm)  # write this branch's chunks (skips if cached)
+                dwell = 0.0
+                on_play = lambda: V.set_preview_mode(self.viewer, True)
+                on_pause = lambda: V.set_preview_mode(self.viewer, False)
+            except Exception as exc:  # no token / network / etc. -> live-glide fallback
+                import warnings
+
+                warnings.warn(f"tube build failed, falling back to live glide: {exc!r}")
+                mode = "live"
+
+        if mode in ("preview", "live"):  # not tube -> clear any preview/tube layers
+            PV.remove_preview_layers(self.viewer)
+            self._tube_layers_added = False
+
+        if mode == "preview":
             try:
                 self._preview = PV.build_preview(
                     self.client, rs, self.root_id,
@@ -179,17 +213,17 @@ class ProofreadSession:
                     max_voxels=self.preview_max_voxels,
                 )
                 PV.add_preview_layers(self.viewer, self._preview, visible=False)
-                # continuous glide over the local preview; swap to live layers on pause
                 dwell = 0.0
-                settle = None
                 on_play = lambda: V.set_preview_mode(self.viewer, True)
                 on_pause = lambda: V.set_preview_mode(self.viewer, False)
-            except Exception as exc:  # no token / out of bounds / etc. -> live-glide fallback
+            except Exception as exc:
                 import warnings
 
                 warnings.warn(f"preview build failed, falling back to live glide: {exc!r}")
                 self._preview = None
-        if self._preview is None:  # live-glide fallback (rest at each node)
+                mode = "live"
+
+        if mode == "live":  # rest at each node so the live seg paints
             settle = self._make_settle()
         V.set_preview_mode(self.viewer, False)  # start paused -> live layers shown
 
@@ -206,7 +240,27 @@ class ProofreadSession:
             on_pause=on_pause,
         )
         self.fly.start()
+        if self._on_fly_change is not None:  # let the panel rebuild its controls for the new fly
+            try:
+                self._on_fly_change()
+            except Exception:
+                pass
         return self.fly
+
+    def _ensure_tube_layers(self) -> None:
+        """Create the per-cell :class:`CellTube` and add its single (persistent) layer pair once.
+
+        The layers point at one shared local volume and are never swapped per branch -- that's
+        what keeps neuroglancer's chunk cache bounded so the glide doesn't slow over a session.
+        """
+        if self._tube is None:
+            self._tube = T.CellTube(
+                self.client, self.root_id, self.tube_mip, self.tube_radius_nm, self.tube_cache_dir,
+            )
+        if not self._tube_layers_added:
+            base = self._tube.serve()
+            T.add_tube_layers(self.viewer, base, self._tube.em_name, self._tube.tgt_name)
+            self._tube_layers_added = True
 
     def _make_settle(self):
         """Per-node worker callback: prefetch upcoming nodes, load-gate, then dwell.
@@ -517,51 +571,103 @@ class ProofreadSession:
     def summary(self) -> dict:
         return self.coverage.summary(self.tree)
 
+    def diagnostics(self) -> dict:
+        """Print signals for debugging the glide perf. Run it after it starts to slow.
+
+        ``tube_wired`` must be True -- if False, this ``sess`` predates the current code
+        (autoreload can't add new __init__ attributes): **restart the kernel and recreate
+        sess**. ``flythrough_threads`` should be 0-1; more means workers are leaking.
+        """
+        import threading
+
+        def _dir_mb(path):
+            total = 0
+            for root, _dirs, files in os.walk(path):
+                for f in files:
+                    try:
+                        total += os.path.getsize(os.path.join(root, f))
+                    except OSError:
+                        pass
+            return round(total / 1e6, 1)
+
+        d = {
+            "tube_wired": hasattr(self, "_tube"),
+            "tube_built": getattr(self, "_tube", None) is not None,
+            "tube_layers_added": getattr(self, "_tube_layers_added", None),
+            "flythrough_threads": sum(t.name == "flythrough" for t in threading.enumerate()),
+            "total_threads": threading.active_count(),
+            "fly_playing": self.fly.is_playing if self.fly else None,
+            "current_path": self.current_path_id,
+            "tube_cache_MB": _dir_mb(self.tube_cache_dir),
+        }
+        for k, v in d.items():
+            print(f"  {k}: {v}")
+        return d
+
     def close(self) -> None:
         if self.fly is not None:
             self.fly.stop()
         self.wal.close()
 
     def panel(self):
-        """An ipywidgets control panel (checklist + review/resolve buttons)."""
-        from ipywidgets import Button, Dropdown, HBox, Label, Output, VBox
-        from IPython.display import display
+        """An ipywidgets control panel (checklist + review/resolve buttons).
 
-        out = Output()
+        Has a single controls area that rebuilds whenever ``self.fly`` changes -- driven by
+        the ``_on_fly_change`` hook -- so Review, **Mark done**, and the ``x`` key all keep
+        the FlyThrough controls + checklist in sync with the current branch (no stale or
+        stacked panels).
+        """
+        from ipywidgets import Button, Dropdown, HBox, Label, Output, VBox
+        from ..controls import FlyThroughControls
+
         status = Label(value=self._status_text())
         todo = self.coverage.to_review(self.tree)
         dd = Dropdown(options=todo, description="path", value=todo[0] if todo else None)
         b_review = Button(description="Review", button_style="primary")
         b_done = Button(description="Mark done (x)")
         b_resolve = Button(description="Resolve supervoxels")
+        controls_box = VBox([])  # holds the current branch's controls; children swapped (never stacks)
+        log_out = Output()       # build logs / messages
 
-        def refresh():
+        def refresh_status():
+            status.value = self._status_text()
             t = self.coverage.to_review(self.tree)
             dd.options = t
-            status.value = self._status_text()
+            if self.current_path_id in t:
+                dd.value = self.current_path_id
+            elif t:
+                dd.value = t[0]
+
+        def rebuild_controls():  # fired by review_path via _on_fly_change
+            if self.fly is not None:
+                self._controls = FlyThroughControls(self.fly, auto_display=False)
+                controls_box.children = (self._controls.panel,)  # replace, not append
+            else:
+                controls_box.children = ()
+            refresh_status()
+
+        self._on_fly_change = rebuild_controls
 
         def on_review(_b):
-            with out:
+            with log_out:
+                log_out.clear_output()
                 if dd.value is not None:
-                    self.review_path(dd.value)
-                    from ..controls import FlyThroughControls
-                    FlyThroughControls(self.fly)
+                    self.review_path(dd.value)  # fires _on_fly_change -> rebuild_controls
 
         def on_done(_b):
-            with out:
-                self._on_mark_done()
-                refresh()
+            with log_out:
+                log_out.clear_output()
+                self._on_mark_done()  # -> review_next -> review_path -> rebuild_controls
 
         def on_resolve(_b):
-            with out:
+            with log_out:
                 print("resolved", self.resolve_supervoxels(), "supervoxels")
 
         b_review.on_click(on_review)
         b_done.on_click(on_done)
         b_resolve.on_click(on_resolve)
-        panel = VBox([HBox([dd, b_review, b_done, b_resolve]), status, out])
-        display(panel)
-        return panel
+        # return (don't display()) so Jupyter renders it exactly once as the cell result
+        return VBox([HBox([dd, b_review, b_done, b_resolve]), status, controls_box, log_out])
 
     def _status_text(self) -> str:
         s = self.summary()
