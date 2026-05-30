@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Phase 0 spike — browser-native fly-through</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: #000;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+      /* neuroglancer attaches here (makeMinimalViewer's default target id) */
+      #neuroglancer-container {
+        position: absolute;
+        inset: 0;
+      }
+      #hud {
+        position: absolute;
+        top: 10px;
+        left: 10px;
+        z-index: 10000;
+        background: rgba(0, 0, 0, 0.72);
+        color: #d7e3ff;
+        padding: 10px 12px;
+        border: 1px solid #2c3a5a;
+        border-radius: 8px;
+        font-size: 12px;
+        line-height: 1.5;
+        min-width: 240px;
+        user-select: none;
+      }
+      #hud h1 {
+        font-size: 12px;
+        margin: 0 0 6px;
+        color: #7fa8ff;
+        letter-spacing: 0.04em;
+      }
+      #hud .row {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+      }
+      #hud .v {
+        color: #fff;
+        font-variant-numeric: tabular-nums;
+      }
+      #hud .warn {
+        color: #ff8a8a;
+      }
+      #hud .ok {
+        color: #8aff9c;
+      }
+      #hud .controls {
+        margin-top: 8px;
+        border-top: 1px solid #2c3a5a;
+        padding-top: 8px;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        align-items: center;
+      }
+      #hud button {
+        background: #1c2740;
+        color: #d7e3ff;
+        border: 1px solid #3a4d78;
+        border-radius: 5px;
+        padding: 3px 9px;
+        cursor: pointer;
+        font: inherit;
+      }
+      #hud button:hover {
+        background: #28365a;
+      }
+      #hud label {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+      }
+      #hud input[type="range"] {
+        width: 90px;
+      }
+      #status {
+        margin-top: 6px;
+        color: #9fb0d0;
+        font-size: 11px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="neuroglancer-container"></div>
+    <div id="hud">
+      <h1>PHASE 0 — client-side rAF camera</h1>
+      <div class="row"><span>uptime</span><span class="v" id="uptime">0:00</span></div>
+      <div class="row"><span>frames</span><span class="v" id="frames">0</span></div>
+      <div class="row"><span>fps (now)</span><span class="v" id="fps">–</span></div>
+      <div class="row"><span>fps (min)</span><span class="v" id="fpsmin">–</span></div>
+      <div class="row"><span>progress</span><span class="v" id="progress">0%</span></div>
+      <div class="controls">
+        <button id="toggle">⏸ pause cam</button>
+        <button id="resetmin">reset min</button>
+        <label>speed <input type="range" id="speed" min="200" max="6000" step="100" value="2000" /></label>
+      </div>
+      <div id="status">loading camera path…</div>
+    </div>
+    <!-- surface ANY runtime error (incl. module-eval errors that fire before main.ts runs)
+         onto the panel, so we don't need DevTools to diagnose the spike. -->
+    <script>
+      function __spikeErr(msg) {
+        var s = document.getElementById("status");
+        if (s) {
+          s.textContent = "✗ " + msg;
+          s.className = "warn";
+        }
+      }
+      window.addEventListener("error", function (e) {
+        __spikeErr(
+          (e.message || e.error) +
+            (e.filename ? " @ " + String(e.filename).split("/").pop() + ":" + e.lineno : ""),
+        );
+        console.error("[spike] error", e.error || e.message);
+      });
+      window.addEventListener("unhandledrejection", function (e) {
+        var r = e.reason;
+        __spikeErr("promise: " + (r && (r.stack || r.message || r)));
+        console.error("[spike] unhandledrejection", r);
+      });
+    </script>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

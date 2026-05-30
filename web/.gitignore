@@ -1,0 +1,4 @@
+node_modules/
+dist/
+public/camera_path.json
+*.log
