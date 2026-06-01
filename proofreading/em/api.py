@@ -131,6 +131,10 @@ def create_app(wal_dir: str, default_datastack: str = "minnie65_public") -> Fast
     def list_annotations(root_id: int):
         return {"annotations": get_session(root_id).list_annotations()}
 
+    @app.delete("/api/cells/{root_id}/annotations/{uuid}")
+    def delete_annotation(root_id: int, uuid: str):
+        return get_session(root_id).delete_annotation(uuid)
+
     @app.on_event("shutdown")
     def _close_sessions():
         for s in sessions.values():

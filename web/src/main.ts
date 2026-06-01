@@ -82,6 +82,9 @@ let speed = 2000;
 let bufferToken = 0; // cancels an in-flight buffering sweep when the branch changes
 let scrubbing = false; // user is dragging the progress slider
 
+// uuid -> {tag, nm} for every drawn mark, so `d` can find the nearest one to the cursor (M2.2)
+const annIndex = new Map<string, { tag: string; nm: [number, number, number] }>();
+
 // fps / degradation tracking
 const t0 = performance.now();
 let last = t0;
@@ -303,8 +306,65 @@ function drawPoint(tag: string, posVox: number[], id: string) {
       point: Float32Array.of(posVox[0], posVox[1], posVox[2]),
       properties: [],
     });
+    // remember it in nm so `d` can find the mark nearest the cursor regardless of branch/zoom
+    annIndex.set(id, { tag, nm: [posVox[0] * resNm[0], posVox[1] * resNm[1], posVox[2] * resNm[2]] });
   } catch (e) {
     console.warn("[em] drawPoint failed", e);
+  }
+}
+
+// remove a mark from its local annotation layer + the index (mirrors the WAL tombstone)
+function removePoint(uuid: string, tag: string) {
+  try {
+    const layer: any = viewer.layerManager.getLayerByName(annLayerName(tag));
+    const src = layer?.layer?.localAnnotations;
+    if (src) {
+      const ref = src.getReference(uuid); // AnnotationReference; addRef'd, so dispose after
+      src.delete(ref);
+      ref.dispose?.();
+    }
+  } catch (e) {
+    console.warn("[em] removePoint failed", e);
+  }
+  annIndex.delete(uuid);
+}
+
+// M2.2 delete: tombstone the mark nearest the cursor (in nm), then drop it from the viewer
+async function deleteNearest() {
+  const ms = viewer?.mouseState;
+  if (!ms?.active || !ms.position || ms.position.length < 3) {
+    status("hover over a mark, then press d to delete", "warn");
+    return;
+  }
+  const cx = ms.position[0] * resNm[0],
+    cy = ms.position[1] * resNm[1],
+    cz = ms.position[2] * resNm[2];
+  let best: string | null = null;
+  let bestTag = "";
+  let bestD = Infinity;
+  for (const [uuid, a] of annIndex) {
+    const d = Math.hypot(a.nm[0] - cx, a.nm[1] - cy, a.nm[2] - cz);
+    if (d < bestD) {
+      bestD = d;
+      best = uuid;
+      bestTag = a.tag;
+    }
+  }
+  const THRESH_NM = 2500; // "under the cursor" — generous vs the ~1 µm tube radius
+  if (!best || bestD > THRESH_NM) {
+    status(
+      annIndex.size ? `no mark near cursor (nearest ${Math.round(bestD)} nm)` : "no marks to delete",
+      "warn",
+    );
+    return;
+  }
+  try {
+    const r = await fetch(`${API}/api/cells/${ROOT_ID}/annotations/${best}`, { method: "DELETE" });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    removePoint(best, bestTag);
+    status(`deleted ${bestTag} (${Math.round(bestD)} nm away)`, "ok");
+  } catch (e) {
+    status(`✗ delete failed: ${e}`, "warn");
   }
 }
 
@@ -444,6 +504,13 @@ async function main() {
       }
       // annotation keys only fire when the cursor is over a data panel
       if (!viewer.mouseState?.active) return;
+      // d / Backspace / Delete = remove the mark nearest the cursor (M2.2)
+      if (e.key === "d" || e.key === "D" || e.key === "Backspace" || e.key === "Delete") {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        deleteNearest();
+        return;
+      }
       const tag = TAG_KEYS[e.key.toLowerCase()];
       if (!tag) return;
       e.preventDefault();

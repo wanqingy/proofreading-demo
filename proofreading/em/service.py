@@ -192,6 +192,22 @@ class CellReviewService:
         st = WAL.load(self.wal.path)
         return [self._ann(a) for a in st.annotations.values()]
 
+    def delete_annotation(self, uuid: str) -> dict:
+        """Soft-delete an annotation (tombstone in the WAL) and rebuild coverage.
+
+        The coverage rebuild is a no-op until merge-prune (M2.4) writes ``omit`` events, but we
+        do it now so that deleting a merge-error mark will later revert the distal omissions it
+        caused. Idempotent: tombstoning an unknown/already-dead uuid is harmless.
+        """
+        existed = uuid in WAL.load(self.wal.path).annotations
+        self.wal.tombstone(uuid)
+        self.coverage = Coverage.from_wal_state(WAL.load(self.wal.path))
+        return {
+            "deleted": existed,
+            "uuid": uuid,
+            "summary": self.coverage.summary(self.tree),
+        }
+
     # ------------------------------------------------------------------ #
     # header / snapshot
     # ------------------------------------------------------------------ #
