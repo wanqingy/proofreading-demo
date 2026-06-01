@@ -14,12 +14,28 @@ import "neuroglancer/unstable/ui/default_viewer.css";
 // Without this the viewer shell loads but layers have no renderer/data backend.
 import "neuroglancer/unstable/main_module.js";
 import { setupDefaultViewer } from "neuroglancer/unstable/ui/default_viewer_setup.js";
+import { makeLayer } from "neuroglancer/unstable/layer/index.js";
 
 // Red overlay for the target-mask layer — mirrors proofreading/em/tube.py `_TINT`.
 const TINT = `void main() {
   float v = toNormalized(getDataValue());
   emitRGBA(vec4(1.0, 0.2, 0.2, v > 0.5 ? 0.6 : 0.0));
 }`;
+
+// annotation tags: key -> tag, and tag -> color (mirrors proofreading/em/viewer.py TAG_COLORS)
+const TAG_KEYS: Record<string, string> = {
+  m: "merge error",
+  s: "split error",
+  e: "extend",
+  q: "question",
+};
+const TAG_COLORS: Record<string, string> = {
+  "merge error": "#ff3333",
+  "split error": "#33aaff",
+  extend: "#33ff66",
+  question: "#ffcc00",
+};
+const annLayerName = (tag: string) => "ann:" + tag.replace(/ /g, "_");
 
 interface Camera {
   path_id: number;
@@ -58,6 +74,7 @@ let ptsVox: [number, number, number][] = [];
 let cum: number[] = [0];
 let totalArc = 0;
 let stepNm = 500;
+let resNm: [number, number, number] = [16, 16, 40]; // tube voxel size (nm); set in setupViewer
 let s = 0;
 let dir = 1; // ping-pong direction
 let phase: "buffer" | "play" = "buffer";
@@ -144,6 +161,7 @@ const frame = (now: number) => {
 
 function setupViewer(cam: Camera) {
   const res = cam.resolution_nm;
+  resNm = res;
   const start = [
     cam.points_nm[0][0] / res[0],
     cam.points_nm[0][1] / res[1],
@@ -195,6 +213,41 @@ function setupViewer(cam: Camera) {
     /* ignore */
   }
   requestAnimationFrame(frame);
+
+  // Add the annotation layers only ONCE the global coordinate space is rank-3 (i.e. after the
+  // em/tgt sources load). A local annotation layer created before then captures rank 0, and a
+  // 3-D point then overflows on render ("offset is out of bounds").
+  const rankWait = window.setInterval(() => {
+    const v = viewer?.navigationState?.pose?.position?.value;
+    if (v && v.length === 3) {
+      window.clearInterval(rankWait);
+      addAnnotationLayers();
+    }
+  }, 200);
+}
+
+let annAdded = false;
+function addAnnotationLayers() {
+  if (annAdded || !viewer) return;
+  try {
+    // Build each layer NOW (global space is rank-3) via the programmatic layer API — NOT
+    // restoreState, which would re-create the image layers and re-race the local annotation
+    // source back to rank-0. makeLayer's local source reads the current (rank-3) global space.
+    for (const [tag, color] of Object.entries(TAG_COLORS)) {
+      const name = annLayerName(tag);
+      if (viewer.layerManager.getLayerByName(name)) continue;
+      const managed = makeLayer(viewer.layerSpecification, name, {
+        type: "annotation",
+        source: "local://annotations",
+        annotationColor: color,
+      });
+      viewer.layerManager.addManagedLayer(managed);
+    }
+    annAdded = true;
+    console.log("[em] annotation layers added (rank-3)");
+  } catch (e) {
+    console.warn("[em] addAnnotationLayers failed", e);
+  }
 }
 
 function setBranch(cam: Camera) {
@@ -210,6 +263,49 @@ function setBranch(cam: Camera) {
   }
   totalArc = cum[cum.length - 1];
   stepNm = cam.step_nm || 500;
+}
+
+// --- annotations (M2.1: drop a colored mark at the cursor) ---
+function drawPoint(tag: string, posVox: number[], id: string) {
+  try {
+    const layer: any = viewer.layerManager.getLayerByName(annLayerName(tag));
+    const src = layer?.layer?.localAnnotations; // the annotation UserLayer's LocalAnnotationSource
+    if (!src) {
+      console.warn("[em] annotation layer not ready for", tag);
+      return;
+    }
+    src.add({
+      type: 0, // AnnotationType.POINT
+      id, // reuse the WAL uuid so we can find/remove it on delete (M2.2)
+      point: Float32Array.of(posVox[0], posVox[1], posVox[2]),
+      properties: [],
+    });
+  } catch (e) {
+    console.warn("[em] drawPoint failed", e);
+  }
+}
+
+async function annotate(tag: string) {
+  const ms = viewer?.mouseState;
+  if (!ms || !ms.active || !ms.position || ms.position.length < 3) {
+    status("hover over the image, then press the key to annotate", "warn");
+    return;
+  }
+  const p = ms.position; // global voxels (same space as nav position)
+  const xyz_nm = [p[0] * resNm[0], p[1] * resNm[1], p[2] * resNm[2]];
+  try {
+    const r = await fetch(`${API}/api/cells/${ROOT_ID}/annotations`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ tag, xyz_nm }),
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const resp = await r.json();
+    drawPoint(tag, [p[0], p[1], p[2]], resp.annotation.uuid);
+    status(`${tag} @ [${xyz_nm.map((x) => Math.round(x)).join(", ")}] nm`, "ok");
+  } catch (e) {
+    status(`✗ annotate failed: ${e}`, "warn");
+  }
 }
 
 // pre-cache the branch (step with idle dwells so neuroglancer loads each frustum), then glide
@@ -269,6 +365,21 @@ async function main() {
   ($("speed") as HTMLInputElement).oninput = (e) =>
     (speed = parseFloat((e.target as HTMLInputElement).value));
   ($("resetmin") as HTMLButtonElement).onclick = () => (fpsMin = Infinity);
+
+  // annotation keys (capture phase + stopImmediatePropagation so they beat neuroglancer's
+  // own m/s/e/q/x/n bindings). Only fire when the cursor is over a data panel.
+  window.addEventListener(
+    "keydown",
+    (e) => {
+      if (!viewer || !viewer.mouseState?.active) return;
+      const tag = TAG_KEYS[e.key.toLowerCase()];
+      if (!tag) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      annotate(tag);
+    },
+    true,
+  );
 
   // open / resume the cell
   status(`opening cell ${ROOT_ID}…`);

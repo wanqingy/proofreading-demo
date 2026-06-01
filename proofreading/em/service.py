@@ -168,6 +168,31 @@ class CellReviewService:
         }
 
     # ------------------------------------------------------------------ #
+    # annotations (M2.1: record + list; merge-prune is M2.4)
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _ann(a) -> dict:
+        return {
+            "uuid": a.uuid,
+            "tag": a.tag,
+            "xyz": [float(c) for c in a.xyz],  # nm
+            "supervoxel": None if a.supervoxel is None else str(int(a.supervoxel)),
+        }
+
+    def add_annotation(self, tag: str, xyz_nm) -> dict:
+        """Record a tagged click (durably to the WAL). Returns the new annotation + summary.
+
+        Merge-error pruning is deferred to M2.4; for now every tag just records a point.
+        """
+        ann = self.wal.add_annotation(tag, xyz_nm, self.root_id, self.mat_version, self.seed)
+        return {"annotation": self._ann(ann), "summary": self.coverage.summary(self.tree)}
+
+    def list_annotations(self) -> list:
+        """Live annotations from the durable log (for redraw on resume)."""
+        st = WAL.load(self.wal.path)
+        return [self._ann(a) for a in st.annotations.values()]
+
+    # ------------------------------------------------------------------ #
     # header / snapshot
     # ------------------------------------------------------------------ #
     def header(self) -> dict:

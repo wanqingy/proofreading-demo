@@ -40,6 +40,11 @@ class OpenCellRequest(BaseModel):
     orient_to_path: bool = False
 
 
+class AnnotateRequest(BaseModel):
+    tag: str
+    xyz_nm: tuple[float, float, float]  # click position in nm
+
+
 def create_app(wal_dir: str, default_datastack: str = "minnie65_public") -> FastAPI:
     wal_dir = os.path.abspath(wal_dir)
     app = FastAPI(title="proofreading-em backend", version="0.1.0")
@@ -113,6 +118,18 @@ def create_app(wal_dir: str, default_datastack: str = "minnie65_public") -> Fast
         payload["em_source"] = f"precomputed://{base}/{payload.pop('em_rel')}"
         payload["tgt_source"] = f"precomputed://{base}/{payload.pop('tgt_rel')}"
         return payload
+
+    @app.post("/api/cells/{root_id}/annotations")
+    def add_annotation(root_id: int, req: AnnotateRequest):
+        s = get_session(root_id)
+        try:
+            return s.add_annotation(req.tag, list(req.xyz_nm))
+        except ValueError as e:  # unknown tag
+            raise HTTPException(400, str(e))
+
+    @app.get("/api/cells/{root_id}/annotations")
+    def list_annotations(root_id: int):
+        return {"annotations": get_session(root_id).list_annotations()}
 
     @app.on_event("shutdown")
     def _close_sessions():
