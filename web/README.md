@@ -9,23 +9,29 @@ path hit (see `docs/proofreading-workflow.md`, "Known limitation & next architec
 **There is no python in the animation loop.** Python only (1) serves the precomputed tube
 and (2) dumps the camera path as static JSON. Everything else runs in the browser.
 
-## Run
+## Run (M1 backend)
 
 Two processes. From the repo root:
 
 ```bash
-# 1. dump the camera path + serve the cached tube (CORS). Leave running.
-uv run --extra em python web/spike_export.py
-#    -> writes web/public/camera_path.json, serves http://localhost:<auto>/{em,tgt}
+# 1. the FastAPI backend — opens cells, lists branches, builds+serves tubes. Leave running.
+uv run --extra em --extra serve python -m proofreading.em.serve
+#    -> http://127.0.0.1:8000  (JSON API under /api, tube precomputed under /tube)
 
 # 2. the frontend dev server
 cd web && npm install   # first time only
 npm run dev             # -> http://localhost:5173
 ```
 
-Open <http://localhost:5173>. It loads the `em` (grayscale) + `tgt` (red) precomputed
-layers and ping-pongs the camera along branches 7–11 of cell `864691135572530981`
-forever. The HUD (top-left) shows uptime / frames / **fps (now)** / **fps (min)**.
+Open <http://localhost:5173>. It opens cell `864691135572530981` (override with
+`?root=<id>` / `?datastack=<ds>` / `?api=<url>` query params), populates a **branch
+picker**, and glides the first to-review branch: a buffering pre-pass caches the branch,
+then it ping-pongs the camera over the `em` (grayscale) + `tgt` (red) tube. Pick another
+branch from the dropdown to jump to it. The HUD shows uptime / frames / **fps (now)** /
+**fps (min)** and the buffer/glide status.
+
+The earlier throwaway `spike_export.py` (single hard-coded branch + its own static server)
+is superseded by the backend; it's left only as a standalone reference.
 
 ## What to watch
 

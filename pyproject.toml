@@ -18,3 +18,9 @@ em = [
     "caveclient>=8.1.0",
     "cloud-volume>=12.13.1",
 ]
+# Headless HTTP backend for the browser-native tool (proofreading.em.api / serve).
+# Run with both extras: `uv run --extra em --extra serve python -m proofreading.em.serve`.
+serve = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+]

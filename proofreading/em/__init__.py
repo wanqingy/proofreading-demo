@@ -43,6 +43,16 @@ except ImportError:  # pragma: no cover
     render_states = load_branch_frames = encode_video = None
     BranchPlayer = None
 
+try:  # headless review service (needs the `em` extra: caveclient/cloud-volume)
+    from .service import CellReviewService
+except ImportError:  # pragma: no cover
+    CellReviewService = None
+
+try:  # HTTP backend (needs the `serve` extra: fastapi/uvicorn)
+    from .api import create_app
+except ImportError:  # pragma: no cover
+    create_app = None
+
 __all__ = [
     "SkeletonTree",
     "BranchPath",
@@ -72,4 +82,6 @@ __all__ = [
     "load_branch_frames",
     "encode_video",
     "BranchPlayer",
+    "CellReviewService",
+    "create_app",
 ]
