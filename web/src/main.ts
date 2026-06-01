@@ -81,6 +81,7 @@ let running = true;
 let speed = 2000;
 let bufferToken = 0; // cancels an in-flight buffering sweep when the branch changes
 let scrubbing = false; // user is dragging the progress slider
+let currentPid: number | null = null; // branch currently loaded (for `x` mark-done)
 
 // uuid -> {tag, nm} for every drawn mark, so `d` can find the nearest one to the cursor (M2.2)
 const annIndex = new Map<string, { tag: string; nm: [number, number, number] }>();
@@ -424,6 +425,48 @@ async function bufferAndPlay(pid: number) {
   status(`branch ${pid}: gliding (stops at end) — ${ptsVox.length} nodes`, "ok");
 }
 
+// --- coverage (M2.3: mark branch done + advance) ---
+const branchOption = (b: Branch) =>
+  `<option value="${b.path_id}">#${b.path_id} · ${b.state} · ${b.compartment} · ${b.n_nodes}n${b.built ? " ✓" : ""}</option>`;
+
+// repaint the branch dropdown from a fresh checklist, keeping the current selection
+function renderBranches(branches: Branch[]) {
+  const sel = $("branch") as HTMLSelectElement;
+  const prev = sel.value;
+  sel.innerHTML = branches.map(branchOption).join("");
+  if (prev && branches.some((b) => String(b.path_id) === prev)) sel.value = prev;
+}
+
+function renderSummary(summary: Record<string, number>) {
+  $("coverage").textContent =
+    `to_review ${summary.to_review ?? 0} · covered ${summary.covered ?? 0} · omitted ${summary.omitted ?? 0}`;
+}
+
+// mark the loaded branch reviewed (durably), repaint coverage, advance to the next to-review
+async function markDone() {
+  if (currentPid === null) return;
+  const pid = currentPid;
+  status(`marking branch ${pid} done…`);
+  try {
+    const r = await fetch(`${API}/api/cells/${ROOT_ID}/branches/${pid}/done`, { method: "POST" });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const resp = await r.json();
+    renderBranches(resp.branches);
+    renderSummary(resp.summary);
+    const next = resp.next_path_id;
+    if (next === null || next === undefined) {
+      running = false;
+      updatePlayButton();
+      status(`✓ branch ${pid} done — cell complete (nothing left to review)`, "ok");
+    } else {
+      status(`✓ branch ${pid} done — advancing to #${next}`, "ok");
+      loadBranch(next);
+    }
+  } catch (e) {
+    status(`✗ mark-done failed: ${e}`, "warn");
+  }
+}
+
 async function loadBranch(pid: number) {
   bufferToken++; // stop any current buffering immediately
   phase = "buffer";
@@ -443,6 +486,7 @@ async function loadBranch(pid: number) {
   }
   if (!viewer) setupViewer(cam);
   setBranch(cam);
+  currentPid = pid;
   ($("branch") as HTMLSelectElement).value = String(pid);
   bufferAndPlay(pid);
 }
@@ -502,6 +546,13 @@ async function main() {
         togglePlay();
         return;
       }
+      // x = mark the current branch done + advance (branch-level, not cursor-dependent)
+      if ((e.key === "x" || e.key === "X") && currentPid !== null) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        markDone();
+        return;
+      }
       // annotation keys only fire when the cursor is over a data panel
       if (!viewer.mouseState?.active) return;
       // d / Backspace / Delete = remove the mark nearest the cursor (M2.2)
@@ -540,18 +591,15 @@ async function main() {
   let branches: Branch[];
   try {
     const br = await fetch(`${API}/api/cells/${ROOT_ID}/branches`);
-    branches = (await br.json()).branches;
+    const data = await br.json();
+    branches = data.branches;
+    renderSummary(data.summary || {});
   } catch (e) {
     status(`✗ couldn't list branches: ${e}`, "warn");
     return;
   }
   const sel = $("branch") as HTMLSelectElement;
-  sel.innerHTML = branches
-    .map(
-      (b) =>
-        `<option value="${b.path_id}">#${b.path_id} · ${b.state} · ${b.compartment} · ${b.n_nodes}n${b.built ? " ✓" : ""}</option>`,
-    )
-    .join("");
+  renderBranches(branches);
   sel.onchange = () => loadBranch(parseInt(sel.value, 10));
 
   // start on the first to-review branch (fallback: first branch)

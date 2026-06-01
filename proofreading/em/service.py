@@ -209,6 +209,31 @@ class CellReviewService:
         }
 
     # ------------------------------------------------------------------ #
+    # coverage (M2.3: mark a branch reviewed + advance)
+    # ------------------------------------------------------------------ #
+    def mark_done(self, path_id: int) -> dict:
+        """Mark a branch reviewed: record its L2 ids visited (durably) and pick the next.
+
+        Mirrors :meth:`ProofreadSession._on_mark_done`: uses the FULL path (incl. the shared
+        proximal node) deliberately -- ``path_state`` classifies on ``bp.vertices[1:]``, so
+        covering the whole path is safe and keeps the parent's shared node counted. Returns
+        the next to-review branch id (or ``None`` = cell complete) plus the refreshed summary
+        and full branch checklist (so the frontend can repaint the dropdown in one round-trip).
+        """
+        pid = int(path_id)
+        bp = self.tree.branch_paths[pid]
+        l2 = self.tree.l2_ids_for_vertices(bp.vertices)
+        self.wal.mark_visited(l2)
+        self.coverage.mark_visited(l2)
+        todo = self.coverage.to_review(self.tree)
+        return {
+            "path_id": pid,
+            "next_path_id": (todo[0] if todo else None),
+            "summary": self.coverage.summary(self.tree),
+            "branches": [self.branch_metadata(b.id) for b in self.tree.branch_paths],
+        }
+
+    # ------------------------------------------------------------------ #
     # header / snapshot
     # ------------------------------------------------------------------ #
     def header(self) -> dict:
