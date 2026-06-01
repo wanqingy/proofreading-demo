@@ -59,7 +59,7 @@ interface Branch {
 
 const params = new URLSearchParams(location.search);
 const API = (params.get("api") || "http://localhost:8000").replace(/\/$/, "");
-const ROOT_ID = params.get("root") || "864691135572530981";
+const ROOT_ID = params.get("root") || "864691135413357554";
 const DATASTACK = params.get("datastack") || "minnie65_public";
 
 const $ = (id: string) => document.getElementById(id)!;
@@ -75,12 +75,12 @@ let cum: number[] = [0];
 let totalArc = 0;
 let stepNm = 500;
 let resNm: [number, number, number] = [16, 16, 40]; // tube voxel size (nm); set in setupViewer
-let s = 0;
-let dir = 1; // ping-pong direction
+let s = 0; // current arc position (nm) along the branch
 let phase: "buffer" | "play" = "buffer";
 let running = true;
 let speed = 2000;
 let bufferToken = 0; // cancels an in-flight buffering sweep when the branch changes
+let scrubbing = false; // user is dragging the progress slider
 
 // fps / degradation tracking
 const t0 = performance.now();
@@ -129,13 +129,11 @@ const frame = (now: number) => {
   frames++;
 
   if (phase === "play" && running && dt > 0 && ptsVox.length >= 2) {
-    s += dir * speed * dt;
+    s += speed * dt; // forward only
     if (s >= totalArc) {
-      s = totalArc;
-      dir = -1;
-    } else if (s <= 0) {
-      s = 0;
-      dir = 1;
+      s = totalArc; // stop at the branch end (no auto-rewind)
+      running = false;
+      updatePlayButton();
     }
     setPosition(posAt(s));
   }
@@ -153,8 +151,9 @@ const frame = (now: number) => {
     const minEl = $("fpsmin");
     minEl.textContent = fpsMin === Infinity ? "–" : fpsMin.toFixed(0);
     minEl.className = "v" + (fpsMin < 40 ? " warn" : fpsMin >= 55 ? " ok" : "");
-    $("progress").textContent =
-      phase === "buffer" ? "buffering" : `${((s / totalArc) * 100).toFixed(0)}%`;
+    const frac = totalArc > 0 ? s / totalArc : 0;
+    $("progresspct").textContent = phase === "buffer" ? "buffering" : `${(frac * 100).toFixed(0)}%`;
+    if (!scrubbing) ($("progress") as HTMLInputElement).value = String(Math.round(frac * 1000));
   }
   requestAnimationFrame(frame);
 };
@@ -245,9 +244,33 @@ function addAnnotationLayers() {
     }
     annAdded = true;
     console.log("[em] annotation layers added (rank-3)");
+    restoreAnnotations(); // redraw any prior-session marks from the WAL
   } catch (e) {
     console.warn("[em] addAnnotationLayers failed", e);
   }
+}
+
+// M2.2 resume: redraw the cell's annotations (from the WAL) onto the layers
+async function restoreAnnotations() {
+  let anns: any[] = [];
+  try {
+    const r = await fetch(`${API}/api/cells/${ROOT_ID}/annotations`);
+    anns = (await r.json()).annotations || [];
+  } catch (e) {
+    console.warn("[em] restore fetch failed", e);
+    return;
+  }
+  if (!anns.length) return;
+  // wait until the local annotation sources have loaded (they init async after addManagedLayer)
+  for (let i = 0; i < 50; i++) {
+    const sample: any = viewer.layerManager.getLayerByName(annLayerName("question"));
+    if (sample?.layer?.localAnnotations) break;
+    await sleep(100);
+  }
+  for (const a of anns) {
+    drawPoint(a.tag, [a.xyz[0] / resNm[0], a.xyz[1] / resNm[1], a.xyz[2] / resNm[2]], a.uuid);
+  }
+  status(`resumed ${anns.length} annotation${anns.length === 1 ? "" : "s"}`, "ok");
 }
 
 function setBranch(cam: Camera) {
@@ -308,12 +331,19 @@ async function annotate(tag: string) {
   }
 }
 
+function updatePlayButton() {
+  ($("toggle") as HTMLButtonElement).textContent = running ? "⏸ pause cam" : "▶ play cam";
+}
+function togglePlay() {
+  running = !running;
+  updatePlayButton();
+}
+
 // pre-cache the branch (step with idle dwells so neuroglancer loads each frustum), then glide
 async function bufferAndPlay(pid: number) {
   const token = ++bufferToken;
   phase = "buffer";
   s = 0;
-  dir = 1;
   const coverStep = Math.max(1, Math.round(1200 / stepNm));
   const stepNodes = Math.max(coverStep, Math.ceil(ptsVox.length / 90));
   for (let i = 0; i < ptsVox.length; i += stepNodes) {
@@ -324,11 +354,14 @@ async function bufferAndPlay(pid: number) {
     await sleep(120);
   }
   if (token !== bufferToken) return;
+  s = 0;
   setPosition(ptsVox[0]);
   await sleep(400);
   if (token !== bufferToken) return;
   phase = "play";
-  status(`branch ${pid}: gliding (ping-pong) — ${ptsVox.length} nodes`, "ok");
+  running = true; // auto-glide the freshly-loaded branch
+  updatePlayButton();
+  status(`branch ${pid}: gliding (stops at end) — ${ptsVox.length} nodes`, "ok");
 }
 
 async function loadBranch(pid: number) {
@@ -358,20 +391,59 @@ async function main() {
   speed = parseFloat(($("speed") as HTMLInputElement).value);
 
   // HUD controls
-  ($("toggle") as HTMLButtonElement).onclick = (e) => {
-    running = !running;
-    (e.target as HTMLButtonElement).textContent = running ? "⏸ pause cam" : "▶ play cam";
-  };
+  ($("toggle") as HTMLButtonElement).onclick = () => togglePlay();
   ($("speed") as HTMLInputElement).oninput = (e) =>
     (speed = parseFloat((e.target as HTMLInputElement).value));
   ($("resetmin") as HTMLButtonElement).onclick = () => (fpsMin = Infinity);
+
+  // cell-id input: load a different cell by reloading with ?root=<id> (the page re-opens it;
+  // each cell resumes its own WAL on the backend). Other params (datastack/api) are preserved.
+  const cellInput = $("cellid") as HTMLInputElement;
+  cellInput.value = ROOT_ID;
+  const loadCell = () => {
+    const id = cellInput.value.trim();
+    if (!id || id === ROOT_ID) return;
+    const p = new URLSearchParams(location.search);
+    p.set("root", id);
+    location.search = p.toString(); // reload with the new cell
+  };
+  ($("loadcell") as HTMLButtonElement).onclick = loadCell;
+  cellInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") loadCell();
+  });
+
+  // progress scrubber: drag to move the camera along the branch (pauses playback so it
+  // doesn't fight the drag). The frame loop updates the slider only when not scrubbing.
+  const prog = $("progress") as HTMLInputElement;
+  const scrubTo = () => {
+    if (phase !== "play" || totalArc <= 0) return;
+    running = false;
+    updatePlayButton();
+    s = (parseFloat(prog.value) / 1000) * totalArc;
+    setPosition(posAt(s));
+  };
+  prog.addEventListener("pointerdown", () => (scrubbing = true));
+  prog.addEventListener("pointerup", () => (scrubbing = false));
+  prog.addEventListener("input", scrubTo);
 
   // annotation keys (capture phase + stopImmediatePropagation so they beat neuroglancer's
   // own m/s/e/q/x/n bindings). Only fire when the cursor is over a data panel.
   window.addEventListener(
     "keydown",
     (e) => {
-      if (!viewer || !viewer.mouseState?.active) return;
+      if (!viewer) return;
+      // ignore while typing in a form field (cell-id input, branch dropdown)
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === "INPUT" || t.tagName === "SELECT" || t.tagName === "TEXTAREA")) return;
+      // space = play/pause (works anywhere, not cursor-dependent)
+      if (e.key === " ") {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        togglePlay();
+        return;
+      }
+      // annotation keys only fire when the cursor is over a data panel
+      if (!viewer.mouseState?.active) return;
       const tag = TAG_KEYS[e.key.toLowerCase()];
       if (!tag) return;
       e.preventDefault();
