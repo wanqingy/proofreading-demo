@@ -45,6 +45,10 @@ class AnnotateRequest(BaseModel):
     xyz_nm: tuple[float, float, float]  # click position in nm
 
 
+class SetRootRequest(BaseModel):
+    xyz_nm: tuple[float, float, float]  # clicked marker position in nm
+
+
 def create_app(wal_dir: str, default_datastack: str = "minnie65_public") -> FastAPI:
     wal_dir = os.path.abspath(wal_dir)
     app = FastAPI(title="proofreading-em backend", version="0.1.0")
@@ -149,6 +153,10 @@ def create_app(wal_dir: str, default_datastack: str = "minnie65_public") -> Fast
     @app.get("/api/cells/{root_id}/skeleton-features")
     def skeleton_features(root_id: int):
         return get_session(root_id).skeleton_features()
+
+    @app.post("/api/cells/{root_id}/root")
+    def set_root(root_id: int, req: SetRootRequest):
+        return get_session(root_id).set_root(list(req.xyz_nm))
 
     @app.on_event("shutdown")
     def _close_sessions():

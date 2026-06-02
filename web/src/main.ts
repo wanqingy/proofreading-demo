@@ -67,6 +67,7 @@ interface Branch {
   length_nm: number;
   compartment: string;
   built: boolean;
+  dist_to_root_nm: number;
 }
 
 const params = new URLSearchParams(location.search);
@@ -112,6 +113,9 @@ let live: LiveSources | null = null;
 let liveShown = false;
 let liveEmLayer: any = null; // ManagedUserLayer refs; held only while paused (removed on play)
 let liveSegLayer: any = null;
+// M4.4: skeleton markers (branch/end points) for click-to-set-root; xyz in nm
+let skelFeatures: { xyz_nm: number[]; path_id: number | null; kind: string }[] = [];
+let rootArmed = false; // set-root mode: armed by the button, consumes ONE marker click
 
 // fps / degradation tracking
 const t0 = performance.now();
@@ -330,6 +334,7 @@ async function drawSkeletonFeatures() {
     console.warn("[em] skeleton-features fetch failed", e);
     return;
   }
+  indexSkelFeatures(feats); // remember for click-to-set-root (M4.4)
   // wait until the local annotation source has loaded (init is async after addManagedLayer)
   for (let i = 0; i < 50; i++) {
     const s: any = viewer.layerManager.getLayerByName(SKEL_END_LAYER);
@@ -346,6 +351,47 @@ async function drawSkeletonFeatures() {
   console.log(
     `[em] skeleton features: ${(feats.branch_points || []).length} branch, ${(feats.end_points || []).length} end`,
   );
+}
+
+function indexSkelFeatures(feats: { branch_points?: any[]; end_points?: any[] }) {
+  skelFeatures = [
+    ...(feats.branch_points || []).map((p) => ({ xyz_nm: p.xyz_nm, path_id: p.path_id, kind: "branch" })),
+    ...(feats.end_points || []).map((p) => ({ xyz_nm: p.xyz_nm, path_id: p.path_id, kind: "end" })),
+  ];
+}
+
+// M4.4: arm/disarm the one-shot set-root mode (deliberate, so a stray click can't re-root)
+function setRootArmed(on: boolean) {
+  rootArmed = on;
+  const btn = $("setroot") as HTMLButtonElement;
+  btn.textContent = on ? "● click a marker" : "set root";
+  btn.style.background = on ? "#5a3a1c" : "";
+  if (on) status("set-root armed — click a branch/end marker on the skeleton", "ok");
+}
+
+// M4.4: re-root the review at the clicked skeleton marker (somaless cells have no real soma, so
+// the skeleton service's default root is an arbitrary tip). Re-derives the branch decomposition +
+// proximal->distal order; markers are undirected (root-invariant) so they don't move; coverage is
+// preserved (L2-keyed). Restarts review at the new most-proximal branch.
+async function setRoot(xyz_nm: number[], kind: string) {
+  status(`setting root at ${kind} point…`);
+  try {
+    const r = await fetch(`${API}/api/cells/${ROOT_ID}/root`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ xyz_nm }),
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const resp = await r.json();
+    indexSkelFeatures(resp.skeleton_features || {}); // refresh path_ids (positions unchanged)
+    renderBranches(resp.branches);
+    renderSummary(resp.summary);
+    const next = (resp.branches as Branch[]).find((b) => b.state === "to_review") || resp.branches[0];
+    status(`root set — review re-derived; starting at branch #${next.path_id}`, "ok");
+    loadBranch(next.path_id);
+  } catch (e) {
+    status(`✗ set-root failed: ${e}`, "warn");
+  }
 }
 
 // M2.2 resume: redraw the cell's annotations (from the WAL) onto the layers
@@ -520,8 +566,9 @@ async function bufferAndPlay(pid: number) {
 }
 
 // --- coverage (M2.3: mark branch done + advance) ---
+// list arrives proximal -> distal (M4.3); show soma-distance so the ordering is legible
 const branchOption = (b: Branch) =>
-  `<option value="${b.path_id}">#${b.path_id} · ${b.state} · ${b.compartment} · ${b.n_nodes}n${b.built ? " ✓" : ""}</option>`;
+  `<option value="${b.path_id}">#${b.path_id} · ${b.state} · ${b.compartment} · ${b.n_nodes}n · ${Math.round(b.dist_to_root_nm / 1000)}µm${b.built ? " ✓" : ""}</option>`;
 
 // repaint the branch dropdown from a fresh checklist, keeping the current selection
 function renderBranches(branches: Branch[]) {
@@ -664,6 +711,7 @@ async function main() {
   ($("speed") as HTMLInputElement).oninput = (e) =>
     (speed = parseFloat((e.target as HTMLInputElement).value));
   ($("resetmin") as HTMLButtonElement).onclick = () => (fpsMin = Infinity);
+  ($("setroot") as HTMLButtonElement).onclick = () => setRootArmed(!rootArmed);
 
   // cell-id input: load a different cell by reloading with ?root=<id> (the page re-opens it;
   // each cell resumes its own WAL on the backend). Other params (datastack/api) are preserved.
@@ -732,6 +780,39 @@ async function main() {
       e.preventDefault();
       e.stopImmediatePropagation();
       annotate(tag);
+    },
+    true,
+  );
+
+  // M4.4: set-root mode. Only fires when ARMED by the "set root" button (so a stray click can't
+  // re-root). Armed + click on a data panel = one-shot: snap to the nearest marker, then disarm.
+  // Off-panel clicks (e.g. the HUD button) are ignored so they stay armed / can cancel.
+  window.addEventListener(
+    "click",
+    (e) => {
+      if (!rootArmed || !viewer || !skelFeatures.length) return;
+      const ms = viewer.mouseState;
+      if (!ms?.active || !ms.position || ms.position.length < 3) return; // off-panel — stay armed
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      const cx = ms.position[0] * resNm[0],
+        cy = ms.position[1] * resNm[1],
+        cz = ms.position[2] * resNm[2];
+      let best: (typeof skelFeatures)[number] | null = null;
+      let bestD = Infinity;
+      for (const f of skelFeatures) {
+        const d = Math.hypot(f.xyz_nm[0] - cx, f.xyz_nm[1] - cy, f.xyz_nm[2] - cz);
+        if (d < bestD) {
+          bestD = d;
+          best = f;
+        }
+      }
+      setRootArmed(false); // one-shot
+      if (!best || bestD > 2000) {
+        status("no skeleton marker near the click — root unchanged", "warn");
+        return;
+      }
+      setRoot(best.xyz_nm, best.kind);
     },
     true,
   );

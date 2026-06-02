@@ -22,7 +22,7 @@ from __future__ import annotations
 import os
 import threading
 import time
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 
 import numpy as np
 
@@ -79,6 +79,10 @@ class CellReviewService:
         self._tube_lock = threading.Lock()
         self._branch_locks: dict[int, threading.Lock] = defaultdict(threading.Lock)
 
+        # proximal->distal review order (M4.3), computed once (the tree is fixed per session)
+        self._dtr: np.ndarray | None = None  # geodesic distance (nm) root->each vertex
+        self._order: list[int] | None = None  # branch ids sorted soma-outward
+
     # ------------------------------------------------------------------ #
     # tube
     # ------------------------------------------------------------------ #
@@ -99,8 +103,88 @@ class CellReviewService:
         )
 
     # ------------------------------------------------------------------ #
-    # branches
+    # branches (M4.3: ordered proximal -> distal, the guidebook sweep)
     # ------------------------------------------------------------------ #
+    def _dist_to_root(self) -> np.ndarray:
+        """Geodesic distance (nm) from the soma root to each vertex, along tree edges (cached)."""
+        if self._dtr is None:
+            tree = self.tree
+            verts = np.asarray(tree.vertices, dtype=float)
+            dist = np.zeros(tree.n, dtype=float)
+            dq = deque([tree.root])
+            while dq:
+                u = dq.popleft()
+                for c in tree.children[u]:
+                    dist[c] = dist[u] + float(np.linalg.norm(verts[c] - verts[u]))
+                    dq.append(c)
+            self._dtr = dist
+        return self._dtr
+
+    def _branch_order(self) -> list[int]:
+        """Branch ids sorted proximal -> distal by the soma-distance of each branch's start node.
+
+        Mirrors guidebook's proximal-first review sweep (it groups by cover-path region + min
+        distance_to_root; ordering by each branch's start distance is the same intent, simpler).
+        Ties (sibling branches sharing a start node) fall back to branch id for determinism.
+        """
+        if self._order is None:
+            dist = self._dist_to_root()
+            bps = self.tree.branch_paths
+            self._order = sorted(
+                range(len(bps)), key=lambda i: (dist[int(bps[i].vertices[0])], i)
+            )
+        return self._order
+
+    # ------------------------------------------------------------------ #
+    # re-rooting (M4.4: somaless cells -> let the user choose the proximal anchor)
+    # ------------------------------------------------------------------ #
+    def _clear_branch_markers(self) -> None:
+        """Drop the per-branch tube ``.done`` markers (branch ids change on re-root).
+
+        The spatial chunks stay on disk and are reused, so re-filling under the new decomposition
+        only fetches genuinely-missing chunks -- fast.
+        """
+        mdir = os.path.join(self.tube_cache_dir, "_branches")
+        if os.path.isdir(mdir):
+            for f in os.listdir(mdir):
+                if f.endswith(".done"):
+                    try:
+                        os.remove(os.path.join(mdir, f))
+                    except OSError:
+                        pass
+
+    def _reroot_at(self, xyz_nm, *, clear_markers: bool) -> int:
+        """Rebuild the tree rooted at the skeleton vertex nearest ``xyz_nm`` (re-derives branch
+        paths, ordering, and the merge-prune distal direction). Coverage (L2-keyed) is untouched."""
+        v = int(self.tree.nearest_vertex(xyz_nm))
+        t = self.tree
+        self.tree = SkeletonTree(
+            vertices=t.vertices, edges=t.edges, root=v,
+            lvl2_ids=t.lvl2_ids, mesh_to_skel_map=t.mesh_to_skel_map,
+            compartment=t.compartment, radius=t.radius, meta=t.meta,
+        )
+        self._dtr = None  # invalidate the proximal->distal caches
+        self._order = None
+        if clear_markers:
+            self._clear_branch_markers()
+        return v
+
+    def set_root(self, xyz_nm) -> dict:
+        """Re-root the review at the vertex nearest the clicked point; return the new structure.
+
+        Branch/end-point markers are root-invariant (undirected), so the frontend only repaints the
+        ordered checklist + summary (markers stay put). ``skeleton_features`` is returned so click-
+        to-jump path ids stay current (M4.5).
+        """
+        v = self._reroot_at(xyz_nm, clear_markers=True)
+        return {
+            "root_vertex": int(v),
+            "root_xyz_nm": [float(c) for c in self.tree.vertices[v]],
+            "branches": [self.branch_metadata(i) for i in self._branch_order()],
+            "summary": self.coverage.summary(self.tree),
+            "skeleton_features": self.skeleton_features(),
+        }
+
     def branch_metadata(self, path_id: int) -> dict:
         bp = self.tree.branch_paths[int(path_id)]
         verts = self.tree.vertices[bp.vertices]
@@ -119,11 +203,13 @@ class CellReviewService:
             "parent": None if bp.parent is None else int(bp.parent),
             "children": [int(c) for c in bp.children],
             "built": self._branch_done(bp.id),
+            "dist_to_root_nm": round(float(self._dist_to_root()[int(bp.vertices[0])]), 1),
         }
 
     def branches(self) -> dict:
+        # ordered proximal -> distal so the checklist + auto-advance sweep the cell soma-outward
         return {
-            "branches": [self.branch_metadata(bp.id) for bp in self.tree.branch_paths],
+            "branches": [self.branch_metadata(i) for i in self._branch_order()],
             "summary": self.coverage.summary(self.tree),
         }
 
@@ -225,12 +311,14 @@ class CellReviewService:
         l2 = self.tree.l2_ids_for_vertices(bp.vertices)
         self.wal.mark_visited(l2)
         self.coverage.mark_visited(l2)
-        todo = self.coverage.to_review(self.tree)
+        # next = the first still-to-review branch in proximal -> distal order (M4.3)
+        todo = set(self.coverage.to_review(self.tree))
+        next_pid = next((i for i in self._branch_order() if i in todo), None)
         return {
             "path_id": pid,
-            "next_path_id": (todo[0] if todo else None),
+            "next_path_id": next_pid,
             "summary": self.coverage.summary(self.tree),
-            "branches": [self.branch_metadata(b.id) for b in self.tree.branch_paths],
+            "branches": [self.branch_metadata(i) for i in self._branch_order()],
         }
 
     # ------------------------------------------------------------------ #
@@ -267,23 +355,24 @@ class CellReviewService:
     def skeleton_features(self) -> dict:
         """Branch points and end points for the 3D guidance overlay (M4.2), the guidebook markers.
 
-        Branch points (``child_count >= 2``) are where **merge/split** errors hide; end points /
-        tips (``child_count == 0``) are where **extends** (premature terminations) hide. Each point
-        is tagged with the id of the branch path that ENDS at it (every branch point / tip is the
-        terminal vertex of exactly one path; the soma root ends no path -> ``null``), so a click can
-        later jump to that branch (M4.5).
+        Branch points (undirected degree >= 3) are where **merge/split** errors hide; end points /
+        tips (degree == 1) are where **extends** (premature terminations) hide. Uses UNDIRECTED
+        degree (like guidebook's ``*_undirected``) so the markers are anatomical and **root-invariant**
+        -- re-rooting (M4.4) doesn't move them, only the ordering/decomposition changes. Each point is
+        tagged with the id of the branch path that ENDS at it (for click-to-jump, M4.5; the chosen
+        root ends no path -> ``null``).
         """
         tree = self.tree
         end_to_path = {int(bp.vertices[-1]): int(bp.id) for bp in tree.branch_paths}
-        cc = tree.child_count
+        deg = np.bincount(tree.edges.reshape(-1), minlength=tree.n)
 
         def _pt(v: int) -> dict:
             xyz = tree.vertices[int(v)]
             return {"xyz_nm": [float(c) for c in xyz], "path_id": end_to_path.get(int(v))}
 
         return {
-            "branch_points": [_pt(int(v)) for v in np.where(cc >= 2)[0]],
-            "end_points": [_pt(int(v)) for v in np.where(cc == 0)[0]],
+            "branch_points": [_pt(int(v)) for v in np.where(deg >= 3)[0]],
+            "end_points": [_pt(int(v)) for v in np.where(deg == 1)[0]],
         }
 
     def _skeleton_source(self) -> str | None:
