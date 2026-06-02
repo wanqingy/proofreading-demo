@@ -15,6 +15,11 @@ import "neuroglancer/unstable/ui/default_viewer.css";
 import "neuroglancer/unstable/main_module.js";
 import { setupDefaultViewer } from "neuroglancer/unstable/ui/default_viewer_setup.js";
 import { makeLayer } from "neuroglancer/unstable/layer/index.js";
+import {
+  CredentialsProvider,
+  makeCredentialsGetter,
+} from "neuroglancer/unstable/credentials_provider/index.js";
+import { registerDefaultCredentialsProvider } from "neuroglancer/unstable/credentials_provider/default_manager.js";
 
 // Red overlay for the target-mask layer — mirrors proofreading/em/tube.py `_TINT`.
 const TINT = `void main() {
@@ -485,7 +490,24 @@ async function markDone() {
   }
 }
 
-// --- live full-res layers (M3.1: swap tube EM <-> live mip0 EM on play/pause) ---
+// M3.2: authenticate the graphene segmentation with our CAVE token. The graphene datasource asks
+// the credentials manager for a "middleauthapp" provider (keyed by the seg server origin); we
+// OVERRIDE it to hand back the token directly — no /auth_info fetch, no OAuth popup, no
+// localStorage. The default viewer builds its credentials manager from this global registry at
+// creation, so registration MUST run before setupDefaultViewer(). The token stays on localhost
+// (the backend binds 127.0.0.1) and is sent only to the graphene server over HTTPS as a Bearer.
+let middleauthRegistered = false;
+function registerMiddleAuthToken(token: string) {
+  if (middleauthRegistered) return;
+  class MiddleAuthTokenProvider extends CredentialsProvider<any> {
+    get = makeCredentialsGetter(async () => ({ tokenType: "Bearer", accessToken: token }));
+  }
+  registerDefaultCredentialsProvider("middleauthapp", () => new MiddleAuthTokenProvider());
+  middleauthRegistered = true;
+  console.log("[em] middleauth token provider registered");
+}
+
+// --- live full-res layers (M3: swap tube <-> live mip0 EM + graphene seg on play/pause) ---
 function ensureLiveLayers() {
   if (liveLayersAdded || !viewer || !live) return;
   try {
@@ -494,8 +516,15 @@ function ensureLiveLayers() {
       source: live.image_source,
     });
     viewer.layerManager.addManagedLayer(em);
+    // the real graphene segmentation, with only this cell's root selected (string: >2^53)
+    const seg = makeLayer(viewer.layerSpecification, "live_seg", {
+      type: "segmentation",
+      source: live.segmentation_source,
+      segments: [live.root_id],
+    });
+    viewer.layerManager.addManagedLayer(seg);
     liveLayersAdded = true;
-    console.log("[em] live layers added");
+    console.log("[em] live layers added (em + seg)");
   } catch (e) {
     console.warn("[em] ensureLiveLayers failed", e);
   }
@@ -505,14 +534,17 @@ function ensureLiveLayers() {
 function setLive(on: boolean) {
   if (on) ensureLiveLayers();
   try {
-    viewer.layerManager.getLayerByName("live_em")?.setVisible(on);
-    viewer.layerManager.getLayerByName("em")?.setVisible(!on);
+    const lm = viewer.layerManager;
+    lm.getLayerByName("live_em")?.setVisible(on);
+    lm.getLayerByName("live_seg")?.setVisible(on);
+    lm.getLayerByName("em")?.setVisible(!on); // tube EM
+    lm.getLayerByName("tgt")?.setVisible(!on); // tube mask — graphene seg replaces it when live
   } catch (e) {
     console.warn("[em] setLive failed", e);
     return;
   }
   liveShown = on;
-  if (on) status("paused — live full-res EM (mip0)", "ok");
+  if (on) status("paused — live full-res EM + segmentation", "ok");
 }
 
 async function loadBranch(pid: number) {
@@ -643,6 +675,8 @@ async function main() {
   } catch (e) {
     console.warn("[em] live-sources fetch failed (tube only)", e);
   }
+  // register the graphene credentials BEFORE the viewer is created (setupViewer runs in loadBranch)
+  if (live?.token) registerMiddleAuthToken(live.token);
 
   // branch checklist -> picker
   let branches: Branch[];
