@@ -18,7 +18,8 @@ from __future__ import annotations
 import os
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as _FuturesTimeout
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from typing import List, Tuple
@@ -242,8 +243,16 @@ def _open_shared(src, cache_dir: str, name: str, data_type: str = "uint8"):
     return local, src
 
 
-def _fill_chunks(local, src, points_nm, radius_nm, transform, workers) -> tuple:
-    """Copy the tube's chunks from ``src`` into ``local`` (parallel). Returns (bytes, fails, n)."""
+def _fill_chunks(local, src, points_nm, radius_nm, transform, workers, budget_s) -> tuple:
+    """Copy the tube's chunks from ``src`` into ``local`` (parallel). Returns (bytes, fails, n).
+
+    ``budget_s`` caps the WHOLE copy: the tube data is served from one host (GCS), whose HTTP
+    connection pool is small, and CloudVolume reads have no socket timeout -- so a wedged read
+    can hang ``ex.map`` forever, holding the branch lock and starving the API (observed on long
+    branches). We wait on the reads with an overall deadline and, on timeout, count the still-
+    pending boxes as failed and ``shutdown(wait=False)`` so the request RETURNS (the leaked
+    worker(s) unwedge on their own; the branch isn't marked ``.done`` -> retried next visit).
+    """
     res = np.asarray(src.resolution, dtype=np.int64)
     b = src.bounds
     off = np.asarray(b.minpt, dtype=np.int64)
@@ -264,9 +273,23 @@ def _fill_chunks(local, src, points_nm, radius_nm, transform, workers) -> tuple:
         except Exception:
             return -1
 
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        sizes = list(ex.map(work, boxes))
-    return sum(s for s in sizes if s > 0), sum(1 for s in sizes if s < 0), len(boxes)
+    ex = ThreadPoolExecutor(max_workers=workers)
+    futs = [ex.submit(work, box) for box in boxes]
+    nbytes = fails = done = 0
+    try:
+        for f in as_completed(futs, timeout=budget_s):
+            done += 1
+            s = f.result()  # work() swallows read errors -> -1; never raises
+            if s > 0:
+                nbytes += s
+            elif s < 0:
+                fails += 1
+    except _FuturesTimeout:
+        fails += len(futs) - done  # the reads still pending at the deadline (likely wedged)
+    finally:
+        # wait=False so a wedged GCS read can't re-hang us on shutdown; cancel any not-yet-started
+        ex.shutdown(wait=False, cancel_futures=True)
+    return nbytes, fails, len(boxes)
 
 
 class CellTube:
@@ -297,9 +320,15 @@ class CellTube:
         self._markers = os.path.join(self.cache_dir, "_branches")
         os.makedirs(self._markers, exist_ok=True)
 
-    def fill_branch(self, path_id, points_nm, *, workers: int = 16, force: bool = False,
-                    verbose: bool = True) -> None:
-        """Write this branch's tube chunks into the shared volumes (skips if already done)."""
+    def fill_branch(self, path_id, points_nm, *, workers: int = 8, budget_s: float = 180.0,
+                    force: bool = False, verbose: bool = True) -> None:
+        """Write this branch's tube chunks into the shared volumes (skips if already done).
+
+        EM and target are filled SEQUENTIALLY (not 2 concurrent executors) so the peak concurrent
+        reads stay at ``workers`` -- both volumes live on the same host (GCS) whose connection pool
+        is only ~10, and exceeding it thrashed the pool + hung long branches. ``budget_s`` bounds
+        each fill (see :func:`_fill_chunks`) so a wedged read can't hang the build indefinitely.
+        """
         marker = os.path.join(self._markers, f"path_{int(path_id)}.done")
         if not force and os.path.exists(marker):
             if verbose:
@@ -309,10 +338,8 @@ class CellTube:
         root = self.root
         tint = lambda d: ((np.asarray(d) == np.uint64(root)) * 255).astype(np.uint8)
         t0 = time.time()
-        with ThreadPoolExecutor(max_workers=2) as ex:  # EM + target concurrently
-            f_em = ex.submit(_fill_chunks, self.em_local, self.em_src, rs, self.radius_nm, None, workers)
-            f_tg = ex.submit(_fill_chunks, self.tgt_local, self.tgt_src, rs, self.radius_nm, tint, workers)
-            (em_b, em_f, em_n), (tg_b, tg_f, tg_n) = f_em.result(), f_tg.result()
+        em_b, em_f, em_n = _fill_chunks(self.em_local, self.em_src, rs, self.radius_nm, None, workers, budget_s)
+        tg_b, tg_f, tg_n = _fill_chunks(self.tgt_local, self.tgt_src, rs, self.radius_nm, tint, workers, budget_s)
         dt = time.time() - t0
         if em_f == 0 and tg_f == 0:  # mark complete so revisiting this branch skips
             try:
