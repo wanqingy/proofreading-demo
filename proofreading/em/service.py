@@ -72,7 +72,9 @@ class CellReviewService:
 
         # durable state (resumes prior coverage if a log already exists)
         self.wal = WAL.for_cell(wal_dir, self.datastack, self.seed)
-        self.coverage = Coverage.from_wal_state(WAL.load(self.wal.path))
+        _state = WAL.load(self.wal.path)
+        self.coverage = Coverage.from_wal_state(_state)
+        self._resume_root_xyz = _state.root_xyz  # re-applied at the end of __init__ (below)
 
         self.tube_cache_dir = os.path.join(
             os.path.abspath(wal_dir), "tube_cache", self.datastack, str(self.root_id)
@@ -93,6 +95,13 @@ class CellReviewService:
         self._prebuilding: set[int] = set()
         self._prebuild_lock = threading.Lock()
         self._epoch = 0  # bumped on re-root so stale in-flight pre-builds abort
+
+        # resume a previously chosen review root (persisted set_root). xyz is resolution-independent
+        # -> nearest_vertex snaps back to the same skeleton vertex. Keep the on-disk tube builds:
+        # this re-derives the SAME decomposition the .done markers were written under, so the cached
+        # branches stay valid (clear_markers=False). Done last: needs the caches + _epoch set above.
+        if self._resume_root_xyz is not None:
+            self._reroot_at(self._resume_root_xyz, clear_markers=False)
 
     # ------------------------------------------------------------------ #
     # tube
@@ -184,11 +193,15 @@ class CellReviewService:
     def set_root(self, xyz_nm) -> dict:
         """Re-root the review at the vertex nearest the clicked point; return the new structure.
 
-        Branch/end-point markers are root-invariant (undirected), so the frontend only repaints the
-        ordered checklist + summary (markers stay put). ``skeleton_features`` is returned so click-
-        to-jump path ids stay current (M4.5).
+        Persisted to the WAL (``set_root`` event) so the choice survives a reload -- ``__init__``
+        re-applies it on open (somaless cells otherwise reset to the skeleton's arbitrary default
+        tip). Branch/end-point markers are root-invariant (undirected), so the frontend only repaints
+        the ordered checklist + summary (markers stay put). ``skeleton_features`` is returned so
+        click-to-jump path ids stay current (M4.5).
         """
         v = self._reroot_at(xyz_nm, clear_markers=True)
+        # persist the SNAPPED vertex position (exact -> nearest_vertex re-snaps to it on reload)
+        self.wal.set_root([float(c) for c in self.tree.vertices[v]])
         return {
             "root_vertex": int(v),
             "root_xyz_nm": [float(c) for c in self.tree.vertices[v]],

@@ -14,6 +14,8 @@ Events
 - ``tombstone`` -- soft-deletes an annotation ``uuid`` (also reverses any ``omit`` it caused).
 - ``visit`` -- marks a batch of L2 ids reviewed (coverage).
 - ``omit`` -- marks L2 ids omitted, keyed to the merge-error annotation ``uuid`` that caused it.
+- ``set_root`` -- the user-chosen review root (``xyz_nm``), so re-rooting survives a reload
+  (somaless cells default to an arbitrary tip). Resolution-independent; last one wins.
 
 One log per cell, named by the **seed supervoxel** (the durable identity), so a later
 session over a new root id appends to and resumes the same log.
@@ -56,6 +58,7 @@ class WalState:
     visited_l2: Set[int] = field(default_factory=set)
     omitted_l2: Set[int] = field(default_factory=set)
     omit_by_uuid: Dict[str, Set[int]] = field(default_factory=dict)
+    root_xyz: Optional[List[float]] = None  # last chosen review root (nm); None = skeleton default
 
 
 class WAL:
@@ -115,6 +118,9 @@ class WAL:
             {"event": "omit", "uuid": because_uuid, "l2_ids": [int(x) for x in l2_ids]}
         )
 
+    def set_root(self, xyz_nm) -> None:
+        self._write({"event": "set_root", "xyz_nm": [float(c) for c in xyz_nm]})
+
     def close(self) -> None:
         self._fh.close()
 
@@ -152,6 +158,8 @@ class WAL:
                     state.omit_by_uuid.setdefault(ev["uuid"], set()).update(
                         int(x) for x in ev["l2_ids"]
                     )
+                elif kind == "set_root":
+                    state.root_xyz = [float(c) for c in ev["xyz_nm"]]  # last wins
         # apply tombstones: drop annotations and reverse any omissions they caused
         for u in tombstoned:
             state.annotations.pop(u, None)
