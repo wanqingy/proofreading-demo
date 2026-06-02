@@ -234,6 +234,36 @@ class CellReviewService:
         }
 
     # ------------------------------------------------------------------ #
+    # live sources (M3: pause -> full-res EM + real graphene segmentation)
+    # ------------------------------------------------------------------ #
+    def live_sources(self) -> dict:
+        """Full-res live layer sources for the pause->live swap.
+
+        The browser shows these only when the camera is IDLE (paused): the mip0 EM is too
+        heavy to stream during motion and graphene seg only paints when idle, so the sparse
+        tube stays the in-motion view. The segmentation source carries the ``middleauth+``
+        prefix so the browser authenticates with the CAVE token (returned here for a JS
+        credentials provider; the backend binds 127.0.0.1 only, so the token stays on localhost).
+        """
+        info = self.client.client.info
+        seg = info.segmentation_source()
+        if seg.startswith("graphene://") and "middleauth+" not in seg:
+            seg = seg.replace("graphene://", "graphene://middleauth+", 1)
+        res = [float(x) for x in np.asarray(info.viewer_resolution(), dtype=float)]
+        token = None
+        try:
+            token = self.client.client.auth.token
+        except Exception:
+            pass
+        return {
+            "root_id": str(self.root_id),  # string: exceeds JS 2^53 safe-int range
+            "image_source": info.image_source(),
+            "segmentation_source": seg,
+            "viewer_resolution_nm": res,
+            "token": token,
+        }
+
+    # ------------------------------------------------------------------ #
     # header / snapshot
     # ------------------------------------------------------------------ #
     def header(self) -> dict:

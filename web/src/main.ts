@@ -86,6 +86,19 @@ let currentPid: number | null = null; // branch currently loaded (for `x` mark-d
 // uuid -> {tag, nm} for every drawn mark, so `d` can find the nearest one to the cursor (M2.2)
 const annIndex = new Map<string, { tag: string; nm: [number, number, number] }>();
 
+// M3: pause -> live full-res layers. `live` holds the source URLs (+ token, M3.2); on PAUSE we
+// show the live EM (and graphene seg, M3.2) and hide the tube, on PLAY we swap back.
+interface LiveSources {
+  root_id: string;
+  image_source: string;
+  segmentation_source: string;
+  viewer_resolution_nm: number[];
+  token: string | null;
+}
+let live: LiveSources | null = null;
+let liveLayersAdded = false;
+let liveShown = false;
+
 // fps / degradation tracking
 const t0 = performance.now();
 let last = t0;
@@ -141,6 +154,11 @@ const frame = (now: number) => {
     }
     setPosition(posAt(s));
   }
+
+  // M3: live full-res layers only while truly paused on a branch (idle) — not during the
+  // buffering sweep or a scrubber drag (camera is moving then), and not before live loaded.
+  const wantLive = !!live && phase === "play" && !running && !scrubbing;
+  if (wantLive !== liveShown) setLive(wantLive);
 
   if (dt > 0) {
     const inst = 1 / dt;
@@ -467,6 +485,36 @@ async function markDone() {
   }
 }
 
+// --- live full-res layers (M3.1: swap tube EM <-> live mip0 EM on play/pause) ---
+function ensureLiveLayers() {
+  if (liveLayersAdded || !viewer || !live) return;
+  try {
+    const em = makeLayer(viewer.layerSpecification, "live_em", {
+      type: "image",
+      source: live.image_source,
+    });
+    viewer.layerManager.addManagedLayer(em);
+    liveLayersAdded = true;
+    console.log("[em] live layers added");
+  } catch (e) {
+    console.warn("[em] ensureLiveLayers failed", e);
+  }
+}
+
+// show the live full-res layers (hide the tube) when paused; reverse when playing
+function setLive(on: boolean) {
+  if (on) ensureLiveLayers();
+  try {
+    viewer.layerManager.getLayerByName("live_em")?.setVisible(on);
+    viewer.layerManager.getLayerByName("em")?.setVisible(!on);
+  } catch (e) {
+    console.warn("[em] setLive failed", e);
+    return;
+  }
+  liveShown = on;
+  if (on) status("paused — live full-res EM (mip0)", "ok");
+}
+
 async function loadBranch(pid: number) {
   bufferToken++; // stop any current buffering immediately
   phase = "buffer";
@@ -585,6 +633,15 @@ async function main() {
   } catch (e) {
     status(`✗ couldn't open cell — is the backend up? (uv run --extra em --extra serve python -m proofreading.em.serve)  ${e}`, "warn");
     return;
+  }
+
+  // M3: prefetch the live full-res sources (shown on pause). Non-fatal — the tube still works.
+  try {
+    const lr = await fetch(`${API}/api/cells/${ROOT_ID}/live-sources`);
+    if (lr.ok) live = await lr.json();
+    console.log("[em] live sources", live);
+  } catch (e) {
+    console.warn("[em] live-sources fetch failed (tube only)", e);
   }
 
   // branch checklist -> picker

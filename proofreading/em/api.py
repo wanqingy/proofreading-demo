@@ -142,6 +142,10 @@ def create_app(wal_dir: str, default_datastack: str = "minnie65_public") -> Fast
             raise HTTPException(404, f"path {path_id} out of range (0..{len(s.tree.branch_paths) - 1})")
         return s.mark_done(path_id)
 
+    @app.get("/api/cells/{root_id}/live-sources")
+    def live_sources(root_id: int):
+        return get_session(root_id).live_sources()
+
     @app.on_event("shutdown")
     def _close_sessions():
         for s in sessions.values():
