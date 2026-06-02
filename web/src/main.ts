@@ -101,8 +101,9 @@ interface LiveSources {
   token: string | null;
 }
 let live: LiveSources | null = null;
-let liveLayersAdded = false;
 let liveShown = false;
+let liveEmLayer: any = null; // ManagedUserLayer refs; held only while paused (removed on play)
+let liveSegLayer: any = null;
 
 // fps / degradation tracking
 const t0 = performance.now();
@@ -508,35 +509,49 @@ function registerMiddleAuthToken(token: string) {
 }
 
 // --- live full-res layers (M3: swap tube <-> live mip0 EM + graphene seg on play/pause) ---
-function ensureLiveLayers() {
-  if (liveLayersAdded || !viewer || !live) return;
+// The live layers are ADDED only while paused and REMOVED on play. Hiding (setVisible) isn't
+// enough: a hidden layer keeps its chunk sources resident and the graphene seg keeps doing
+// background work, both of which compete with the tube's buffering sweep for the deliberately
+// bounded chunk cache + download queue -> the next branch builds/buffers slower. Removing frees
+// them (removeManagedLayer disposes the layer), so motion buffers as fast as before M3.
+function addLiveLayers() {
+  if (liveSegLayer || !viewer || !live) return;
   try {
-    const em = makeLayer(viewer.layerSpecification, "live_em", {
+    liveEmLayer = makeLayer(viewer.layerSpecification, "live_em", {
       type: "image",
       source: live.image_source,
     });
-    viewer.layerManager.addManagedLayer(em);
+    viewer.layerManager.addManagedLayer(liveEmLayer);
     // the real graphene segmentation, with only this cell's root selected (string: >2^53)
-    const seg = makeLayer(viewer.layerSpecification, "live_seg", {
+    liveSegLayer = makeLayer(viewer.layerSpecification, "live_seg", {
       type: "segmentation",
       source: live.segmentation_source,
       segments: [live.root_id],
     });
-    viewer.layerManager.addManagedLayer(seg);
-    liveLayersAdded = true;
+    viewer.layerManager.addManagedLayer(liveSegLayer);
     console.log("[em] live layers added (em + seg)");
   } catch (e) {
-    console.warn("[em] ensureLiveLayers failed", e);
+    console.warn("[em] addLiveLayers failed", e);
   }
 }
 
-// show the live full-res layers (hide the tube) when paused; reverse when playing
+function removeLiveLayers() {
+  for (const l of [liveSegLayer, liveEmLayer]) {
+    try {
+      if (l && viewer.layerManager.has(l)) viewer.layerManager.removeManagedLayer(l);
+    } catch (e) {
+      console.warn("[em] removeLiveLayers failed", e);
+    }
+  }
+  liveEmLayer = liveSegLayer = null;
+}
+
+// paused: add the live layers + hide the tube. playing: remove the live layers + show the tube.
 function setLive(on: boolean) {
-  if (on) ensureLiveLayers();
   try {
     const lm = viewer.layerManager;
-    lm.getLayerByName("live_em")?.setVisible(on);
-    lm.getLayerByName("live_seg")?.setVisible(on);
+    if (on) addLiveLayers();
+    else removeLiveLayers();
     lm.getLayerByName("em")?.setVisible(!on); // tube EM
     lm.getLayerByName("tgt")?.setVisible(!on); // tube mask — graphene seg replaces it when live
   } catch (e) {
