@@ -23,6 +23,7 @@ import os
 import threading
 import time
 from collections import Counter, defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -49,6 +50,7 @@ class CellReviewService:
         tube_mip: int = 1,
         tube_radius_nm: float = 1000.0,
         orient_to_path: bool = False,
+        prebuild_ahead: int = 2,
     ):
         self.client = emclient
         self.root_id = int(root_id)
@@ -82,6 +84,15 @@ class CellReviewService:
         # proximal->distal review order (M4.3), computed once (the tree is fixed per session)
         self._dtr: np.ndarray | None = None  # geodesic distance (nm) root->each vertex
         self._order: list[int] | None = None  # branch ids sorted soma-outward
+
+        # background pre-build (M4): build the next to-review branch(es) while the user reviews the
+        # current one, so advancing is instant. Single worker -> one branch at a time, full
+        # bandwidth during review (the current branch's build already finished + is just gliding).
+        self.prebuild_ahead = int(prebuild_ahead)
+        self._prebuild_ex = ThreadPoolExecutor(max_workers=1, thread_name_prefix="prebuild")
+        self._prebuilding: set[int] = set()
+        self._prebuild_lock = threading.Lock()
+        self._epoch = 0  # bumped on re-root so stale in-flight pre-builds abort
 
     # ------------------------------------------------------------------ #
     # tube
@@ -165,6 +176,7 @@ class CellReviewService:
         )
         self._dtr = None  # invalidate the proximal->distal caches
         self._order = None
+        self._epoch += 1  # abort any in-flight pre-builds for the old decomposition
         if clear_markers:
             self._clear_branch_markers()
         return v
@@ -241,6 +253,7 @@ class CellReviewService:
             seconds = round(time.time() - t0, 1)
 
         rel = f"tube/{self.datastack}/{self.root_id}"
+        prebuilding = self._queue_prebuild(pid)  # build the next to-review branch(es) in the bg
         return {
             "path_id": pid,
             "root_id": str(self.root_id),  # string: exceeds JS 2^53 safe-int range
@@ -251,7 +264,68 @@ class CellReviewService:
             "em_rel": f"{rel}/{tube.em_name}",
             "tgt_rel": f"{rel}/{tube.tgt_name}",
             "build": {"cached": bool(cached), "seconds": seconds},
+            "prebuilding": prebuilding,
         }
+
+    # ------------------------------------------------------------------ #
+    # background pre-build (M4: hide the next branch's build behind review time)
+    # ------------------------------------------------------------------ #
+    def _queue_prebuild(self, after_path_id: int) -> list[int]:
+        """Queue background builds of the next to-review branch(es) (proximal->distal) after the
+        current one. Returns the path ids queued (for an optional HUD hint)."""
+        if self.prebuild_ahead <= 0:
+            return []
+        order = self._branch_order()
+        try:
+            start = order.index(int(after_path_id)) + 1
+        except ValueError:
+            start = 0
+        queued: list[int] = []
+        for pid in order[start:]:
+            if len(queued) >= self.prebuild_ahead:
+                break
+            bp = self.tree.branch_paths[pid]
+            if self.coverage.path_state(self.tree, bp) != "to_review" or self._branch_done(pid):
+                continue
+            with self._prebuild_lock:
+                if pid in self._prebuilding:
+                    continue
+                self._prebuilding.add(pid)
+            self._prebuild_ex.submit(self._prebuild, pid, self._epoch)
+            queued.append(int(pid))
+        return queued
+
+    def _prebuild(self, path_id: int, epoch: int) -> None:
+        """Background worker: build one branch's tube unless a re-root (epoch bump) invalidated it.
+
+        Shares ``_branch_locks[pid]`` with on-demand ``camera_path``, so a fetch of a branch that
+        is mid-pre-build just blocks until it's done, then sees it cached -- never a double build.
+        """
+        pid = int(path_id)
+        try:
+            if epoch != self._epoch or self._branch_done(pid):
+                return  # early-out: re-rooted or already built before we got scheduled
+            tube = self.ensure_tube()
+            with self._branch_locks[pid]:
+                # everything under the lock + the verified epoch, so a concurrent re-root can't
+                # make us fill stale verts or leave a stale .done that an on-demand fetch observes
+                if epoch != self._epoch or self._branch_done(pid):
+                    return
+                bp = self.tree.branch_paths[pid]
+                verts = np.asarray(self.tree.vertices[bp.vertices], dtype=float)
+                tube.fill_branch(pid, verts, verbose=False)
+                if epoch != self._epoch:
+                    # re-rooted DURING the fill: this .done is for the OLD decomposition -> drop it
+                    # inside the lock, before any on-demand fetch can see it
+                    try:
+                        os.remove(os.path.join(self.tube_cache_dir, "_branches", f"path_{pid}.done"))
+                    except OSError:
+                        pass
+        except Exception:
+            pass  # best-effort; an on-demand fetch will build it if needed
+        finally:
+            with self._prebuild_lock:
+                self._prebuilding.discard(pid)
 
     # ------------------------------------------------------------------ #
     # annotations (M2.1: record + list; merge-prune is M2.4)
@@ -408,6 +482,10 @@ class CellReviewService:
         }
 
     def close(self) -> None:
+        try:
+            self._prebuild_ex.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
         try:
             self.wal.close()
         except Exception:

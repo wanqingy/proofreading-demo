@@ -59,6 +59,7 @@ interface Camera {
   em_source: string;
   tgt_source: string;
   build: { cached: boolean; seconds: number };
+  prebuilding?: number[];
 }
 interface Branch {
   path_id: number;
@@ -95,6 +96,7 @@ let speed = 2000;
 let bufferToken = 0; // cancels an in-flight buffering sweep when the branch changes
 let scrubbing = false; // user is dragging the progress slider
 let currentPid: number | null = null; // branch currently loaded (for `x` mark-done)
+let prebuildingHint: number[] = []; // branches the backend is pre-building (for the HUD hint)
 
 // uuid -> {tag, nm} for every drawn mark, so `d` can find the nearest one to the cursor (M2.2)
 const annIndex = new Map<string, { tag: string; nm: [number, number, number] }>();
@@ -562,7 +564,8 @@ async function bufferAndPlay(pid: number) {
   phase = "play";
   running = true; // auto-glide the freshly-loaded branch
   updatePlayButton();
-  status(`branch ${pid}: gliding (stops at end) — ${ptsVox.length} nodes`, "ok");
+  const hint = prebuildingHint.length ? ` · ↻ pre-building #${prebuildingHint.join(", #")}` : "";
+  status(`branch ${pid}: gliding (stops at end) — ${ptsVox.length} nodes${hint}`, "ok");
 }
 
 // --- coverage (M2.3: mark branch done + advance) ---
@@ -699,6 +702,7 @@ async function loadBranch(pid: number) {
   if (!viewer) setupViewer(cam);
   setBranch(cam);
   currentPid = pid;
+  prebuildingHint = cam.prebuilding || [];
   ($("branch") as HTMLSelectElement).value = String(pid);
   bufferAndPlay(pid);
 }
