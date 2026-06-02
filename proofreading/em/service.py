@@ -355,9 +355,9 @@ class CellReviewService:
     def delete_annotation(self, uuid: str) -> dict:
         """Soft-delete an annotation (tombstone in the WAL) and rebuild coverage.
 
-        The coverage rebuild is a no-op until merge-prune (M2.4) writes ``omit`` events, but we
-        do it now so that deleting a merge-error mark will later revert the distal omissions it
-        caused. Idempotent: tombstoning an unknown/already-dead uuid is harmless.
+        Deleting an ``omit_branch`` mark reverts its omission: the rebuilt coverage drops the
+        ``omit`` event keyed to this uuid, so the branch + descendants return to ``to_review``. We
+        return the refreshed checklist so the frontend repaints in one round-trip. Idempotent.
         """
         existed = uuid in WAL.load(self.wal.path).annotations
         self.wal.tombstone(uuid)
@@ -366,6 +366,7 @@ class CellReviewService:
             "deleted": existed,
             "uuid": uuid,
             "summary": self.coverage.summary(self.tree),
+            "branches": [self.branch_metadata(i) for i in self._branch_order()],
         }
 
     # ------------------------------------------------------------------ #
@@ -390,6 +391,38 @@ class CellReviewService:
         next_pid = next((i for i in self._branch_order() if i in todo), None)
         return {
             "path_id": pid,
+            "next_path_id": next_pid,
+            "summary": self.coverage.summary(self.tree),
+            "branches": [self.branch_metadata(i) for i in self._branch_order()],
+        }
+
+    def omit_branch(self, path_id: int) -> dict:
+        """Omit a branch + its DISTAL DESCENDANTS from review (a foreign segment to be split off).
+
+        Per-branch on purpose (NOT prune-everything-distal-from-a-vertex): at an X crossing the
+        cell's true continuation is a *sibling* branch, so omitting only this branch's subtree
+        (``subtree_mask(bp.vertices[1])`` -- excludes the shared junction + siblings) leaves the
+        continuation to-review. Anchored to a 'merge error' mark at the junction so it persists and
+        is reversed by deleting that mark (see :meth:`delete_annotation`); the mark also records
+        WHERE the split is needed for the manual edit. 'Distal' is relative to the current root.
+        """
+        pid = int(path_id)
+        bp = self.tree.branch_paths[pid]
+        distal_root = int(bp.vertices[1]) if len(bp.vertices) >= 2 else int(bp.vertices[0])
+        mask = self.tree.subtree_mask(distal_root, include_root=True)
+        l2 = self.tree.l2_ids_for_vertices(np.where(mask)[0])
+        junction_xyz = [float(c) for c in self.tree.vertices[int(bp.vertices[0])]]
+        ann = self.wal.add_annotation(
+            "merge error", junction_xyz, self.root_id, self.mat_version, self.seed
+        )
+        self.wal.mark_omitted(l2, because_uuid=ann.uuid)
+        self.coverage.mark_omitted(l2)
+        todo = set(self.coverage.to_review(self.tree))
+        next_pid = next((i for i in self._branch_order() if i in todo), None)
+        return {
+            "path_id": pid,
+            "omitted_l2_count": int(len(l2)),
+            "annotation": self._ann(ann),
             "next_path_id": next_pid,
             "summary": self.coverage.summary(self.tree),
             "branches": [self.branch_metadata(i) for i in self._branch_order()],

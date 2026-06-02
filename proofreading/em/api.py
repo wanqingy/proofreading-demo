@@ -146,6 +146,13 @@ def create_app(wal_dir: str, default_datastack: str = "minnie65_public") -> Fast
             raise HTTPException(404, f"path {path_id} out of range (0..{len(s.tree.branch_paths) - 1})")
         return s.mark_done(path_id)
 
+    @app.post("/api/cells/{root_id}/branches/{path_id}/omit")
+    def omit_branch(root_id: int, path_id: int):
+        s = get_session(root_id)
+        if path_id < 0 or path_id >= len(s.tree.branch_paths):
+            raise HTTPException(404, f"path {path_id} out of range (0..{len(s.tree.branch_paths) - 1})")
+        return s.omit_branch(path_id)
+
     @app.get("/api/cells/{root_id}/live-sources")
     def live_sources(root_id: int):
         return get_session(root_id).live_sources()

@@ -93,7 +93,7 @@
   <body>
     <div id="neuroglancer-container"></div>
     <div id="hud">
-      <h1>EM REVIEW — M4 (pre-build next)</h1>
+      <h1>EM REVIEW — M2.4 (omit branch)</h1>
       <div class="row" style="margin-bottom: 6px; gap: 4px">
         <input id="cellid" placeholder="root id" style="flex: 1; min-width: 0; background: #1c2740; color: #d7e3ff; border: 1px solid #3a4d78; border-radius: 5px; padding: 3px; font: inherit" />
         <button id="loadcell">load</button>
@@ -115,11 +115,12 @@
       <div class="controls">
         <button id="toggle">⏸ pause cam</button>
         <button id="setroot">set root</button>
+        <button id="omit">omit branch</button>
         <button id="resetmin">reset min</button>
         <label>speed <input type="range" id="speed" min="200" max="6000" step="100" value="2000" /></label>
       </div>
       <div id="legend" style="margin-top: 6px; color: #7f8db0; font-size: 11px">
-        <b style="color:#d7e3ff">space</b> play/pause (pause→live EM) · <b style="color:#d7e3ff">x</b> branch done · annotate at cursor:
+        <b style="color:#d7e3ff">space</b> play/pause (pause→live EM) · <b style="color:#d7e3ff">x</b> branch done · <b style="color:#d7e3ff">o</b> omit branch · annotate at cursor:
         <b style="color:#ff3333">m</b> merge · <b style="color:#33aaff">s</b> split ·
         <b style="color:#33ff66">e</b> extend · <b style="color:#ffcc00">q</b> question ·
         <b style="color:#d7e3ff">d</b> delete nearest<br />

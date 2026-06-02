@@ -504,7 +504,11 @@ async function deleteNearest() {
   try {
     const r = await fetch(`${API}/api/cells/${ROOT_ID}/annotations/${best}`, { method: "DELETE" });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const resp = await r.json();
     removePoint(best, bestTag);
+    // deleting a merge mark un-omits its branch -> repaint the checklist/summary
+    if (resp.branches) renderBranches(resp.branches);
+    if (resp.summary) renderSummary(resp.summary);
     status(`deleted ${bestTag} (${Math.round(bestD)} nm away)`, "ok");
   } catch (e) {
     status(`✗ delete failed: ${e}`, "warn");
@@ -682,6 +686,35 @@ function setLive(on: boolean) {
   if (on) status("paused — live full-res EM + segmentation", "ok");
 }
 
+// M2.4: omit the current branch + its distal descendants (a foreign segment to be split off). At
+// an X crossing the cell's continuation is a sibling branch, so it stays to-review. Reversible by
+// deleting the red merge mark dropped at the junction (`d`).
+async function omitBranch() {
+  if (currentPid === null) return;
+  const pid = currentPid;
+  status(`omitting branch ${pid}…`);
+  try {
+    const r = await fetch(`${API}/api/cells/${ROOT_ID}/branches/${pid}/omit`, { method: "POST" });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const resp = await r.json();
+    const a = resp.annotation;
+    if (a) drawPoint(a.tag, [a.xyz[0] / resNm[0], a.xyz[1] / resNm[1], a.xyz[2] / resNm[2]], a.uuid);
+    renderBranches(resp.branches);
+    renderSummary(resp.summary);
+    const next = resp.next_path_id;
+    if (next === null || next === undefined) {
+      running = false;
+      updatePlayButton();
+      status(`⊘ branch ${pid} omitted (${resp.omitted_l2_count} L2) — nothing left to review`, "ok");
+    } else {
+      status(`⊘ branch ${pid} omitted (${resp.omitted_l2_count} L2) — advancing to #${next}`, "ok");
+      loadBranch(next);
+    }
+  } catch (e) {
+    status(`✗ omit failed: ${e}`, "warn");
+  }
+}
+
 async function loadBranch(pid: number) {
   bufferToken++; // stop any current buffering immediately
   phase = "buffer";
@@ -716,6 +749,7 @@ async function main() {
     (speed = parseFloat((e.target as HTMLInputElement).value));
   ($("resetmin") as HTMLButtonElement).onclick = () => (fpsMin = Infinity);
   ($("setroot") as HTMLButtonElement).onclick = () => setRootArmed(!rootArmed);
+  ($("omit") as HTMLButtonElement).onclick = () => omitBranch();
 
   // cell-id input: load a different cell by reloading with ?root=<id> (the page re-opens it;
   // each cell resumes its own WAL on the backend). Other params (datastack/api) are preserved.
@@ -768,6 +802,13 @@ async function main() {
         e.preventDefault();
         e.stopImmediatePropagation();
         markDone();
+        return;
+      }
+      // o = omit the current branch + its distal descendants (foreign / to be split off)
+      if ((e.key === "o" || e.key === "O") && currentPid !== null) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        omitBranch();
         return;
       }
       // annotation keys only fire when the cursor is over a data panel
