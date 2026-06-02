@@ -146,6 +146,10 @@ def create_app(wal_dir: str, default_datastack: str = "minnie65_public") -> Fast
     def live_sources(root_id: int):
         return get_session(root_id).live_sources()
 
+    @app.get("/api/cells/{root_id}/skeleton-features")
+    def skeleton_features(root_id: int):
+        return get_session(root_id).skeleton_features()
+
     @app.on_event("shutdown")
     def _close_sessions():
         for s in sessions.values():

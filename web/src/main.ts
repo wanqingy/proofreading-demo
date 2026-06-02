@@ -42,6 +42,13 @@ const TAG_COLORS: Record<string, string> = {
 };
 const annLayerName = (tag: string) => "ann:" + tag.replace(/ /g, "_");
 
+// M4.2: skeleton guidance markers (guidebook). Branch points = merge/split candidates; end
+// points/tips = extend candidates. Distinct from the 4 tag colors; local point layers, always-on.
+const SKEL_BRANCH_LAYER = "skel:branch";
+const SKEL_END_LAYER = "skel:end";
+const SKEL_BRANCH_COLOR = "#cc66ff"; // branch points — magenta
+const SKEL_END_COLOR = "#ffffff"; // end points / tips — white
+
 interface Camera {
   path_id: number;
   root_id: string;
@@ -279,12 +286,66 @@ function addAnnotationLayers() {
       });
       viewer.layerManager.addManagedLayer(managed);
     }
+    // M4.2: skeleton guidance marker layers (branch + end points), always-on point overlays
+    for (const [name, color] of [
+      [SKEL_BRANCH_LAYER, SKEL_BRANCH_COLOR],
+      [SKEL_END_LAYER, SKEL_END_COLOR],
+    ] as const) {
+      if (viewer.layerManager.getLayerByName(name)) continue;
+      const managed = makeLayer(viewer.layerSpecification, name, {
+        type: "annotation",
+        source: "local://annotations",
+        annotationColor: color,
+      });
+      viewer.layerManager.addManagedLayer(managed);
+    }
     annAdded = true;
     console.log("[em] annotation layers added (rank-3)");
     restoreAnnotations(); // redraw any prior-session marks from the WAL
+    drawSkeletonFeatures(); // M4.2: branch + end point guidance markers
   } catch (e) {
     console.warn("[em] addAnnotationLayers failed", e);
   }
+}
+
+// M4.2: draw branch points + end points (from the skeleton) onto their guidance layers
+function drawSkelPoint(layerName: string, posVox: number[], id: string) {
+  try {
+    const layer: any = viewer.layerManager.getLayerByName(layerName);
+    const src = layer?.layer?.localAnnotations;
+    if (!src) return;
+    src.add({ type: 0, id, point: Float32Array.of(posVox[0], posVox[1], posVox[2]), properties: [] });
+  } catch (e) {
+    console.warn("[em] drawSkelPoint failed", e);
+  }
+}
+
+async function drawSkeletonFeatures() {
+  let feats: { branch_points?: any[]; end_points?: any[] };
+  try {
+    const r = await fetch(`${API}/api/cells/${ROOT_ID}/skeleton-features`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    feats = await r.json();
+  } catch (e) {
+    console.warn("[em] skeleton-features fetch failed", e);
+    return;
+  }
+  // wait until the local annotation source has loaded (init is async after addManagedLayer)
+  for (let i = 0; i < 50; i++) {
+    const s: any = viewer.layerManager.getLayerByName(SKEL_END_LAYER);
+    if (s?.layer?.localAnnotations) break;
+    await sleep(100);
+  }
+  const toVox = (p: any): [number, number, number] => [
+    p.xyz_nm[0] / resNm[0],
+    p.xyz_nm[1] / resNm[1],
+    p.xyz_nm[2] / resNm[2],
+  ];
+  (feats.branch_points || []).forEach((p, i) => drawSkelPoint(SKEL_BRANCH_LAYER, toVox(p), `bp${i}`));
+  (feats.end_points || []).forEach((p, i) => drawSkelPoint(SKEL_END_LAYER, toVox(p), `ep${i}`));
+  console.log(
+    `[em] skeleton features: ${(feats.branch_points || []).length} branch, ${(feats.end_points || []).length} end`,
+  );
 }
 
 // M2.2 resume: redraw the cell's annotations (from the WAL) onto the layers

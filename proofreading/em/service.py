@@ -264,6 +264,28 @@ class CellReviewService:
             "token": token,
         }
 
+    def skeleton_features(self) -> dict:
+        """Branch points and end points for the 3D guidance overlay (M4.2), the guidebook markers.
+
+        Branch points (``child_count >= 2``) are where **merge/split** errors hide; end points /
+        tips (``child_count == 0``) are where **extends** (premature terminations) hide. Each point
+        is tagged with the id of the branch path that ENDS at it (every branch point / tip is the
+        terminal vertex of exactly one path; the soma root ends no path -> ``null``), so a click can
+        later jump to that branch (M4.5).
+        """
+        tree = self.tree
+        end_to_path = {int(bp.vertices[-1]): int(bp.id) for bp in tree.branch_paths}
+        cc = tree.child_count
+
+        def _pt(v: int) -> dict:
+            xyz = tree.vertices[int(v)]
+            return {"xyz_nm": [float(c) for c in xyz], "path_id": end_to_path.get(int(v))}
+
+        return {
+            "branch_points": [_pt(int(v)) for v in np.where(cc >= 2)[0]],
+            "end_points": [_pt(int(v)) for v in np.where(cc == 0)[0]],
+        }
+
     def _skeleton_source(self) -> str | None:
         """skeletoncache precomputed skeleton source (M4): a 3D backdrop of the cell skeleton.
 
