@@ -259,9 +259,26 @@ class CellReviewService:
             "root_id": str(self.root_id),  # string: exceeds JS 2^53 safe-int range
             "image_source": info.image_source(),
             "segmentation_source": seg,
+            "skeleton_source": self._skeleton_source(),
             "viewer_resolution_nm": res,
             "token": token,
         }
+
+    def _skeleton_source(self) -> str | None:
+        """skeletoncache precomputed skeleton source (M4): a 3D backdrop of the cell skeleton.
+
+        Same origin as the graphene seg (``minnie.microns-daf.com``), so the browser's injected
+        middleauth token (M3.2) authorizes it. Skeleton-only (no volumetric) -> renders in the 3D
+        panel, nothing in the 2D cross-section, so the EM review view stays clean.
+        """
+        try:
+            sk = self.client.client.skeleton
+            server = sk.server_address.rstrip("/")
+            api_v = getattr(sk, "api_version", 1)
+            base = f"{server}/skeletoncache/api/v{api_v}/{self.datastack}/precomputed/skeleton/"
+            return f"precomputed://middleauth+{base}"
+        except Exception:
+            return None
 
     # ------------------------------------------------------------------ #
     # header / snapshot

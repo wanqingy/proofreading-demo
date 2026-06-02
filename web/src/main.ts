@@ -97,6 +97,7 @@ interface LiveSources {
   root_id: string;
   image_source: string;
   segmentation_source: string;
+  skeleton_source: string | null;
   viewer_resolution_nm: number[];
   token: string | null;
 }
@@ -194,17 +195,25 @@ function setupViewer(cam: Camera) {
     cam.points_nm[0][1] / res[1],
     cam.points_nm[0][2] / res[2],
   ];
+  // M4.1: a skeleton-only segmentation layer = the whole-cell skeleton in the 3D panel. It's
+  // skeleton-only (no volumetric) so it renders ONLY in 3D, nothing in the 2D cross-section, and
+  // shares the graphene origin so the injected middleauth token (M3.2) authorizes it. Always-on.
+  const skelLayers = live?.skeleton_source
+    ? [{ type: "segmentation", name: "skeleton", source: live.skeleton_source, segments: [live.root_id] }]
+    : [];
   const state = {
     dimensions: { x: [res[0] * 1e-9, "m"], y: [res[1] * 1e-9, "m"], z: [res[2] * 1e-9, "m"] },
     position: start,
     // zoom tight on the neurite so the cross-section stays inside the ~1 µm tube radius
     crossSectionScale: 0.12,
-    projectionScale: 6000,
+    // 3D panel zoomed way out to frame the whole cell (~hundreds of µm); independent of the 2D zoom
+    projectionScale: live?.skeleton_source ? 400000 : 6000,
     layers: [
       { type: "image", name: "em", source: cam.em_source },
       { type: "image", name: "tgt", source: cam.tgt_source, shader: TINT, opacity: 0.85 },
+      ...skelLayers,
     ],
-    layout: "xy",
+    layout: live?.skeleton_source ? "xy-3d" : "xy",
     showDefaultAnnotations: false,
   };
   viewer = setupDefaultViewer();

@@ -1,6 +1,6 @@
 # EM proofreading workflow — design & v1 plan
 
-_Last updated: 2026-05-29. Vocabulary in [../CONTEXT.md](../CONTEXT.md); decision
+_Last updated: 2026-06-01. Vocabulary in [../CONTEXT.md](../CONTEXT.md); decision
 records in [adr/](adr/). Builds on the [`proofreading/`](../proofreading/) package
 (`FlyThrough`, `FlyThroughControls`)._
 
@@ -101,6 +101,52 @@ classify each by **L2-id coverage** (`covered` / `new` / `changed`) → emit the
 - **Skeleton overlay** — current branch path + a position marker; full-cell skeleton faint.
 - **Annotation layers** — per-tag, colored, always visible.
 - **3D panel** — skeleton + position + annotations (skeleton-only; no mesh).
+
+See [3D skeleton guidance](#3d-skeleton-guidance--branch--end-points-2026-06-01) below for
+the built-out design (branch/end points, topological ordering, current-branch highlight).
+
+## 3D skeleton guidance — branch & end points (2026-06-01)
+
+Adds a 3D skeleton overview to the browser-native tool to orient the reviewer and **guide
+attention to the features that matter**, modeled on **guidebook** ([`ceesem/guidebook`](https://github.com/ceesem/guidebook)).
+
+**What guidebook is.** A skeleton-guidance proofreading tool: root id → skeleton → mark
+**branch points** + **end points** → order them topologically (cover paths + distance-to-root,
+proximal-first) → emit a *static* `nglui` neuroglancer link. Branch points are where
+**merge/split** errors hide; end points are where **extends** (premature terminations) hide.
+
+**What we reuse — and what we don't.**
+- _Recipe, yes._ Branch + end points and proximal→distal cover-path ordering. We already have
+  every primitive in `SkeletonTree`: `child_count >= 2` = branch points, `child_count == 0` =
+  tips/end points, `branch_paths` = cover paths, `parent[]` = distance-to-root. So we **port the
+  ~20-line ordering recipe** (`build_topo_dataframes`) onto our tree — **no new deps**.
+- _Flask app / `nglui` statebuilder, no._ guidebook renders a static, python-side ngl state; we
+  are **browser-native** (JS drives a live viewer), so its rendering layer doesn't fit.
+- _`pcg_skel`, earmarked for Phase C._ guidebook can skeletonize from the **chunked graph**. The
+  skeletoncache cached skeleton is perfect for `minnie65_public`, but **after an edit the cached
+  skeleton is stale** — `pcg_skel` (which returns a `meshparty.Skeleton`, natively carrying these
+  primitives) is the right engine to re-skeletonize the edited cell. Adopt it when Phase C lands;
+  consider standardizing the skeleton representation on `meshparty.Skeleton` then, so cached and
+  pcg_skel cells share one code path. (`pcg_skel`/`meshparty`/`nglui` are all currently absent —
+  the `em` extra is just `caveclient` + `cloud-volume`.)
+
+**Design (browser-native).**
+- **Skeleton backdrop (always on):** a skeleton-only segmentation layer using the skeletoncache
+  precomputed source `precomputed://middleauth+{server}/skeletoncache/api/v1/{datastack}/precomputed/skeleton/`
+  (server from `client.skeleton.server_address`), `segments:[root_id]`, in an **`xy-3d`** layout.
+  Same origin as the graphene seg, so the injected middleauth token (M3.2) already authorizes it.
+  Skeleton-only ⇒ lightweight, loads once, doesn't change per branch.
+- **Branch points + end points (always on):** two colored local point-annotation layers built from
+  `SkeletonTree` (a new `service.skeleton_features()` endpoint).
+- **Topological order:** `branches()` + the to-review/next-branch selection ordered proximal→distal
+  by distance-to-root (guidebook recipe ported onto `SkeletonTree`).
+- **Current-branch highlight:** a bright local line-annotation layer tracing the branch under
+  review (reuse the camera `points_nm`), redrawn on branch change, on top of the dim full skeleton.
+- **(Optional) clickable points → jump:** tag each feature point with its branch-path id; click in
+  3D → `loadBranch`. Turns guidebook's static map into navigation.
+
+**Caveat:** neuroglancer's perspective view re-centers on the navigation position, so during a glide
+the 3D skeleton drifts; mitigate by keeping the 3D zoomed out (whole-cell `projectionScale`).
 
 ## Data model & persistence
 
