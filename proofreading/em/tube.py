@@ -320,7 +320,7 @@ class CellTube:
         self._markers = os.path.join(self.cache_dir, "_branches")
         os.makedirs(self._markers, exist_ok=True)
 
-    def fill_branch(self, path_id, points_nm, *, workers: int = 8, budget_s: float = 180.0,
+    def fill_branch(self, path_id, points_nm, *, workers: int = 8, budget_s: float = 360.0,
                     force: bool = False, verbose: bool = True) -> None:
         """Write this branch's tube chunks into the shared volumes (skips if already done).
 

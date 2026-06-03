@@ -92,7 +92,7 @@ let resNm: [number, number, number] = [16, 16, 40]; // tube voxel size (nm); set
 let s = 0; // current arc position (nm) along the branch
 let phase: "buffer" | "play" = "buffer";
 let running = true;
-let speed = 2000;
+let speed = 1000;
 let bufferToken = 0; // cancels an in-flight buffering sweep when the branch changes
 let scrubbing = false; // user is dragging the progress slider
 let currentPid: number | null = null; // branch currently loaded (for `x` mark-done)
@@ -119,12 +119,8 @@ let liveSegLayer: any = null;
 let skelFeatures: { xyz_nm: number[]; path_id: number | null; kind: string }[] = [];
 let rootArmed = false; // set-root mode: armed by the button, consumes ONE marker click
 
-// fps / degradation tracking
-const t0 = performance.now();
-let last = t0;
+let last = performance.now();
 let frames = 0;
-let fpsSmooth = 0;
-let fpsMin = Infinity;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -155,10 +151,6 @@ const posAt = (q: number): [number, number, number] => {
   return [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f];
 };
 
-const fmt = (ms: number) => {
-  const t = Math.floor(ms / 1000);
-  return `${Math.floor(t / 60)}:${String(t % 60).padStart(2, "0")}`;
-};
 
 const frame = (now: number) => {
   const dt = (now - last) / 1000;
@@ -180,19 +172,7 @@ const frame = (now: number) => {
   const wantLive = !!live && phase === "play" && !running && !scrubbing;
   if (wantLive !== liveShown) setLive(wantLive);
 
-  if (dt > 0) {
-    const inst = 1 / dt;
-    fpsSmooth = fpsSmooth ? fpsSmooth * 0.9 + inst * 0.1 : inst;
-    if (phase === "play" && now - t0 > 2000 && fpsSmooth < fpsMin) fpsMin = fpsSmooth;
-  }
-
   if (frames % 6 === 0) {
-    $("uptime").textContent = fmt(now - t0);
-    $("frames").textContent = String(frames);
-    $("fps").textContent = fpsSmooth.toFixed(0);
-    const minEl = $("fpsmin");
-    minEl.textContent = fpsMin === Infinity ? "–" : fpsMin.toFixed(0);
-    minEl.className = "v" + (fpsMin < 40 ? " warn" : fpsMin >= 55 ? " ok" : "");
     const frac = totalArc > 0 ? s / totalArc : 0;
     $("progresspct").textContent = phase === "buffer" ? "buffering" : `${(frac * 100).toFixed(0)}%`;
     if (!scrubbing) ($("progress") as HTMLInputElement).value = String(Math.round(frac * 1000));
@@ -212,18 +192,23 @@ function setupViewer(cam: Camera) {
   // skeleton-only (no volumetric) so it renders ONLY in 3D, nothing in the 2D cross-section, and
   // shares the graphene origin so the injected middleauth token (M3.2) authorizes it. Always-on.
   const skelLayers = live?.skeleton_source
-    ? [{ type: "segmentation", name: "skeleton", source: live.skeleton_source, segments: [live.root_id] }]
+    ? [{
+        type: "segmentation", name: "skeleton", source: live.skeleton_source, segments: [live.root_id],
+        selectedAlpha: 0.2,           // 2D cross-section opacity
+        objectAlpha: 0.8,             // 3D mesh opacity
+        meshSilhouetteRendering: 1.7, // silhouette strength
+      }]
     : [];
   const state = {
     dimensions: { x: [res[0] * 1e-9, "m"], y: [res[1] * 1e-9, "m"], z: [res[2] * 1e-9, "m"] },
     position: start,
     // zoom tight on the neurite so the cross-section stays inside the ~1 µm tube radius
-    crossSectionScale: 0.12,
+    crossSectionScale: 0.20,
     // 3D panel zoomed way out to frame the whole cell (~hundreds of µm); independent of the 2D zoom
-    projectionScale: live?.skeleton_source ? 400000 : 6000,
+    projectionScale: live?.skeleton_source ? 10000 : 6000,
     layers: [
-      { type: "image", name: "em", source: cam.em_source },
-      { type: "image", name: "tgt", source: cam.tgt_source, shader: TINT, opacity: 0.85 },
+      { type: "image", name: "em", source: cam.em_source, shaderControls: { normalized: { range: [100, 155] } } },
+      { type: "image", name: "tgt", source: cam.tgt_source, shader: TINT, opacity: 0.2 },
       ...skelLayers,
     ],
     layout: live?.skeleton_source ? "xy-3d" : "xy",
@@ -551,9 +536,10 @@ async function bufferAndPlay(pid: number) {
   const token = ++bufferToken;
   phase = "buffer";
   s = 0;
+  // Visit every ~1200 nm along the branch so the local precomputed is warm for every frustum.
+  // No upper-count cap: long branches need proportionally more dwell positions.
   const coverStep = Math.max(1, Math.round(1200 / stepNm));
-  const stepNodes = Math.max(coverStep, Math.ceil(ptsVox.length / 90));
-  for (let i = 0; i < ptsVox.length; i += stepNodes) {
+  for (let i = 0; i < ptsVox.length; i += coverStep) {
     if (token !== bufferToken) return; // a newer branch took over
     setPosition(ptsVox[i]);
     const pct = Math.round((i / Math.max(1, ptsVox.length - 1)) * 100);
@@ -566,10 +552,10 @@ async function bufferAndPlay(pid: number) {
   await sleep(400);
   if (token !== bufferToken) return;
   phase = "play";
-  running = true; // auto-glide the freshly-loaded branch
+  running = false; // stay paused after buffering; user presses play to start
   updatePlayButton();
   const hint = prebuildingHint.length ? ` · ↻ pre-building #${prebuildingHint.join(", #")}` : "";
-  status(`branch ${pid}: gliding (stops at end) — ${ptsVox.length} nodes${hint}`, "ok");
+  status(`branch ${pid}: ready — ${ptsVox.length} nodes${hint}`, "ok");
 }
 
 // --- coverage (M2.3: mark branch done + advance) ---
@@ -644,6 +630,7 @@ function addLiveLayers() {
     liveEmLayer = makeLayer(viewer.layerSpecification, "live_em", {
       type: "image",
       source: live.image_source,
+      shaderControls: { normalized: { range: [100, 155] } },
     });
     viewer.layerManager.addManagedLayer(liveEmLayer);
     // the real graphene segmentation, with only this cell's root selected (string: >2^53)
@@ -651,6 +638,9 @@ function addLiveLayers() {
       type: "segmentation",
       source: live.segmentation_source,
       segments: [live.root_id],
+      selectedAlpha: 0.2,
+      objectAlpha: 0.8,
+      meshSilhouetteRendering: 1.7,
     });
     viewer.layerManager.addManagedLayer(liveSegLayer);
     console.log("[em] live layers added (em + seg)");
@@ -747,7 +737,6 @@ async function main() {
   ($("toggle") as HTMLButtonElement).onclick = () => togglePlay();
   ($("speed") as HTMLInputElement).oninput = (e) =>
     (speed = parseFloat((e.target as HTMLInputElement).value));
-  ($("resetmin") as HTMLButtonElement).onclick = () => (fpsMin = Infinity);
   ($("setroot") as HTMLButtonElement).onclick = () => setRootArmed(!rootArmed);
   ($("omit") as HTMLButtonElement).onclick = () => omitBranch();
 
