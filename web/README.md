@@ -17,7 +17,7 @@ Two processes. From the repo root:
 # 1. the FastAPI backend — opens cells, lists branches, builds+serves tubes. Leave running.
 uv run --extra em --extra serve python -m proofreading.em.serve
 #    -> http://127.0.0.1:8000  (JSON API under /api, tube precomputed under /tube)
-
+ 
 # 2. the frontend dev server
 cd web && npm install   # first time only
 npm run dev             # -> http://localhost:5173

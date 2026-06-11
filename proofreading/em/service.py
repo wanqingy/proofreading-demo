@@ -360,10 +360,75 @@ class CellReviewService:
         ann = self.wal.add_annotation(tag, xyz_nm, self.root_id, self.mat_version, self.seed)
         return {"annotation": self._ann(ann), "summary": self.coverage.summary(self.tree)}
 
+    # datastack with the editable production segmentation (minnie3_v1); used for Spelunker links
+    # regardless of the session datastack so links always open the live proofreading table
+    _SPELUNKER_DATASTACK = "minnie65_phase3_v1"
+
+    def _spelunker_client(self):
+        """Lazy-cached CAVEclient for the production datastack (for Spelunker URL generation)."""
+        if not hasattr(self, "_spelunker_client_cache"):
+            from caveclient import CAVEclient
+            self._spelunker_client_cache = CAVEclient(self._SPELUNKER_DATASTACK)
+        return self._spelunker_client_cache
+
+    def _spelunker_url(self, xyz_nm: list) -> str:
+        """Spelunker URL at the given nm position with this cell's root selected.
+
+        Always uses the minnie65_phase3_v1 CAVEclient so nglui derives the production
+        minnie3_v1 segmentation source, even when the session is against minnie65_public.
+        """
+        from nglui.statebuilder import ViewerState
+        client = self._spelunker_client()
+        res = np.array(client.info.viewer_resolution(), dtype=float)
+        pos = (np.array(xyz_nm, dtype=float) / res).tolist()
+        return (
+            ViewerState(client=client, position=pos, show_slices=True, layout="xy-3d")
+            .add_layers_from_client(
+                client=client,
+                segmentation_kws={"segments": [str(self.root_id)]},
+            )
+            .to_url(target_site="spelunker")
+        )
+
     def list_annotations(self) -> list:
         """Live annotations from the durable log (for redraw on resume)."""
         st = WAL.load(self.wal.path)
-        return [self._ann(a) for a in st.annotations.values()]
+        return [
+            {**self._ann(a), "done": a.uuid in st.done_uuids, "spelunker_url": self._spelunker_url(a.xyz)}
+            for a in st.annotations.values()
+        ]
+
+    def toggle_annotation_status(self, uuid: str) -> dict:
+        """Toggle the done/todo status of an annotation and persist to the WAL."""
+        state = WAL.load(self.wal.path)
+        if uuid not in state.annotations:
+            raise KeyError(f"annotation {uuid} not found")
+        done = uuid not in state.done_uuids  # flip current state
+        self.wal.set_annotation_done(uuid, done)
+        return {"uuid": uuid, "done": done}
+
+    def resolve(self) -> dict:
+        """Batch-resolve annotation click positions → supervoxel IDs, then re-resolve the cell root.
+
+        Called once per Phase B session (after edits are done in Spelunker). Fills ``supervoxel``
+        on every live annotation in the WAL via ``points_to_supervoxels`` + a ``resolve_supervoxel``
+        write per annotation, then calls ``current_root(self.seed)`` to find the cell's new root.
+        The seed supervoxel (soma) is stable across split/merge edits; the root ID is not.
+        """
+        state = WAL.load(self.wal.path)
+        anns = list(state.annotations.values())
+        if not anns:
+            return {"annotations": [], "new_root_id": str(self.root_id), "resolved_count": 0}
+        xyzs = np.array([a.xyz for a in anns])           # (N, 3) nm
+        svs = self.client.points_to_supervoxels(xyzs)    # (N,) uint64
+        for ann, sv in zip(anns, svs):
+            self.wal.resolve_supervoxel(ann.uuid, int(sv))
+        new_root = self.client.current_root(self.seed)
+        return {
+            "annotations": [{**self._ann(a), "spelunker_url": self._spelunker_url(a.xyz)} for a in anns],
+            "new_root_id": str(new_root),
+            "resolved_count": len(anns),
+        }
 
     def delete_annotation(self, uuid: str) -> dict:
         """Soft-delete an annotation (tombstone in the WAL) and rebuild coverage.

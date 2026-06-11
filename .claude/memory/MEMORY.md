@@ -1,0 +1,2 @@
+- [Flythrough cleanup](flythrough-cleanup.md) — proofreading-demo package status + deferred auto-nearby-skeletons follow-up (see repo NOTES.md)
+- [EM proofreading workflow](em-proofreading-workflow.md) — Phase A+B built on branch proofreading-package-and-em-design; Phase B = review.html annotation queue + Spelunker links (nglui/minnie3_v1) + WAL done/todo; M4.5 highlight hidden; all uncommitted

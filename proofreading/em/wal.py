@@ -12,6 +12,8 @@ Events
   CloudVolume -- see :mod:`proofreading.em.client`).
 - ``resolve`` -- attaches a ``supervoxel`` to an annotation ``uuid``.
 - ``tombstone`` -- soft-deletes an annotation ``uuid`` (also reverses any ``omit`` it caused).
+- ``ann_status`` -- records whether an annotation has been addressed (``done: bool``).
+  Last write per uuid wins; used by the Phase B review queue to track progress.
 - ``visit`` -- marks a batch of L2 ids reviewed (coverage).
 - ``omit`` -- marks L2 ids omitted, keyed to the merge-error annotation ``uuid`` that caused it.
 - ``set_root`` -- the user-chosen review root (``xyz_nm``), so re-rooting survives a reload
@@ -55,6 +57,7 @@ class WalState:
     """Reconstructed state after replaying a log."""
 
     annotations: Dict[str, Annotation] = field(default_factory=dict)  # live (un-tombstoned)
+    done_uuids: Set[str] = field(default_factory=set)  # annotations marked done in Phase B
     visited_l2: Set[int] = field(default_factory=set)
     omitted_l2: Set[int] = field(default_factory=set)
     omit_by_uuid: Dict[str, Set[int]] = field(default_factory=dict)
@@ -110,6 +113,9 @@ class WAL:
     def tombstone(self, uuid: str) -> None:
         self._write({"event": "tombstone", "uuid": uuid})
 
+    def set_annotation_done(self, uuid: str, done: bool) -> None:
+        self._write({"event": "ann_status", "uuid": uuid, "done": done})
+
     def mark_visited(self, l2_ids) -> None:
         self._write({"event": "visit", "l2_ids": [int(x) for x in l2_ids]})
 
@@ -152,6 +158,11 @@ class WAL:
                         ann.supervoxel = int(ev["supervoxel"])
                 elif kind == "tombstone":
                     tombstoned.add(ev["uuid"])
+                elif kind == "ann_status":
+                    if ev.get("done"):
+                        state.done_uuids.add(ev["uuid"])
+                    else:
+                        state.done_uuids.discard(ev["uuid"])
                 elif kind == "visit":
                     state.visited_l2.update(int(x) for x in ev["l2_ids"])
                 elif kind == "omit":

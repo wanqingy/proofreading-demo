@@ -46,8 +46,10 @@ const annLayerName = (tag: string) => "ann:" + tag.replace(/ /g, "_");
 // points/tips = extend candidates. Distinct from the 4 tag colors; local point layers, always-on.
 const SKEL_BRANCH_LAYER = "skel:branch";
 const SKEL_END_LAYER = "skel:end";
+// const SKEL_HIGHLIGHT_LAYER = "skel:highlight"; // M4.5 hidden — does not redraw on branch switch
 const SKEL_BRANCH_COLOR = "#cc66ff"; // branch points — magenta
 const SKEL_END_COLOR = "#ffffff"; // end points / tips — white
+// const SKEL_HIGHLIGHT_COLOR = "#ffff00"; // M4.5 hidden — bright yellow; re-enable with layer
 
 interface Camera {
   path_id: number;
@@ -118,6 +120,7 @@ let liveSegLayer: any = null;
 // M4.4: skeleton markers (branch/end points) for click-to-set-root; xyz in nm
 let skelFeatures: { xyz_nm: number[]; path_id: number | null; kind: string }[] = [];
 let rootArmed = false; // set-root mode: armed by the button, consumes ONE marker click
+// let highlightIds: string[] = []; // M4.5 hidden
 
 let last = performance.now();
 let frames = 0;
@@ -290,10 +293,21 @@ function addAnnotationLayers() {
       });
       viewer.layerManager.addManagedLayer(managed);
     }
+    // M4.5: highlight layer hidden pending branch-switch bug fix (polyline does not redraw on change)
+    // if (!viewer.layerManager.getLayerByName(SKEL_HIGHLIGHT_LAYER)) {
+    //   viewer.layerManager.addManagedLayer(
+    //     makeLayer(viewer.layerSpecification, SKEL_HIGHLIGHT_LAYER, {
+    //       type: "annotation",
+    //       source: "local://annotations",
+    //       annotationColor: SKEL_HIGHLIGHT_COLOR,
+    //     }),
+    //   );
+    // }
     annAdded = true;
     console.log("[em] annotation layers added (rank-3)");
     restoreAnnotations(); // redraw any prior-session marks from the WAL
     drawSkeletonFeatures(); // M4.2: branch + end point guidance markers
+    // if (ptsVox.length >= 2) drawBranchHighlight(ptsVox); // M4.5 hidden
   } catch (e) {
     console.warn("[em] addAnnotationLayers failed", e);
   }
@@ -310,6 +324,32 @@ function drawSkelPoint(layerName: string, posVox: number[], id: string) {
     console.warn("[em] drawSkelPoint failed", e);
   }
 }
+
+// M4.5 hidden — polyline does not redraw when branch changes; re-investigate before re-enabling.
+// async function drawBranchHighlight(pts: [number, number, number][]) {
+//   try {
+//     let src: any = null;
+//     for (let i = 0; i < 50; i++) {
+//       const layer: any = viewer?.layerManager?.getLayerByName(SKEL_HIGHLIGHT_LAYER);
+//       src = layer?.layer?.localAnnotations;
+//       if (src) break;
+//       await sleep(100);
+//     }
+//     if (!src) return;
+//     for (const id of highlightIds) {
+//       try { const ref = src.getReference(id); src.delete(ref); ref.dispose?.(); } catch { /* gone */ }
+//     }
+//     highlightIds = [];
+//     for (let i = 0; i < pts.length - 1; i++) {
+//       const id = `hl${i}`;
+//       src.add({ type: 1, id,
+//         pointA: Float32Array.of(pts[i][0], pts[i][1], pts[i][2]),
+//         pointB: Float32Array.of(pts[i + 1][0], pts[i + 1][1], pts[i + 1][2]),
+//         properties: [] });
+//       highlightIds.push(id);
+//     }
+//   } catch (e) { console.warn("[em] drawBranchHighlight failed", e); }
+// }
 
 async function drawSkeletonFeatures() {
   let feats: { branch_points?: any[]; end_points?: any[] };
@@ -724,6 +764,7 @@ async function loadBranch(pid: number) {
   }
   if (!viewer) setupViewer(cam);
   setBranch(cam);
+  // drawBranchHighlight(ptsVox); // M4.5 hidden — does not redraw on branch switch
   currentPid = pid;
   prebuildingHint = cam.prebuilding || [];
   ($("branch") as HTMLSelectElement).value = String(pid);

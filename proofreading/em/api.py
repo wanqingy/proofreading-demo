@@ -139,6 +139,13 @@ def create_app(wal_dir: str, default_datastack: str = "minnie65_public") -> Fast
     def delete_annotation(root_id: int, uuid: str):
         return get_session(root_id).delete_annotation(uuid)
 
+    @app.post("/api/cells/{root_id}/annotations/{uuid}/status")
+    def toggle_annotation_status(root_id: int, uuid: str):
+        try:
+            return get_session(root_id).toggle_annotation_status(uuid)
+        except KeyError as e:
+            raise HTTPException(404, str(e))
+
     @app.post("/api/cells/{root_id}/branches/{path_id}/done")
     def mark_branch_done(root_id: int, path_id: int):
         s = get_session(root_id)
@@ -164,6 +171,10 @@ def create_app(wal_dir: str, default_datastack: str = "minnie65_public") -> Fast
     @app.post("/api/cells/{root_id}/root")
     def set_root(root_id: int, req: SetRootRequest):
         return get_session(root_id).set_root(list(req.xyz_nm))
+
+    @app.post("/api/cells/{root_id}/resolve")
+    def resolve_supervoxels(root_id: int):
+        return get_session(root_id).resolve()
 
     @app.on_event("shutdown")
     def _close_sessions():

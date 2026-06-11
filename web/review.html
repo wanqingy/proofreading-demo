@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Phase B — Annotation Queue</title>
+    <style>
+      body {
+        margin: 0;
+        background: #0a0f1e;
+        color: #d7e3ff;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 13px;
+      }
+      #app {
+        max-width: 900px;
+        margin: 0 auto;
+        padding: 24px 20px;
+      }
+      h1 {
+        font-size: 13px;
+        color: #7fa8ff;
+        letter-spacing: 0.06em;
+        margin: 0 0 14px;
+        text-transform: uppercase;
+      }
+      .row {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        margin-bottom: 12px;
+        flex-wrap: wrap;
+      }
+      input {
+        background: #1c2740;
+        color: #d7e3ff;
+        border: 1px solid #3a4d78;
+        border-radius: 5px;
+        padding: 4px 8px;
+        font: inherit;
+      }
+      button {
+        background: #1c2740;
+        color: #d7e3ff;
+        border: 1px solid #3a4d78;
+        border-radius: 5px;
+        padding: 4px 10px;
+        cursor: pointer;
+        font: inherit;
+      }
+      button:hover {
+        background: #28365a;
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      #anncount {
+        color: #9fb0d0;
+        margin-bottom: 10px;
+        font-size: 12px;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+      th {
+        text-align: left;
+        color: #7fa8ff;
+        font-size: 11px;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+        border-bottom: 1px solid #2c3a5a;
+        padding: 5px 8px;
+      }
+      td {
+        padding: 6px 8px;
+        border-bottom: 1px solid #131c30;
+        vertical-align: middle;
+      }
+      tr:hover td {
+        background: #101828;
+      }
+      .tag {
+        font-weight: bold;
+        font-size: 11px;
+        border-radius: 3px;
+        padding: 1px 5px;
+        background: rgba(255, 255, 255, 0.06);
+      }
+      .sv {
+        font-size: 10px;
+        color: #9fb0d0;
+      }
+      a.splink {
+        color: #7fa8ff;
+        text-decoration: none;
+        border: 1px solid #3a4d78;
+        border-radius: 4px;
+        padding: 2px 7px;
+        font-size: 11px;
+        white-space: nowrap;
+      }
+      a.splink:hover {
+        background: #1c2740;
+      }
+      #status {
+        margin-top: 14px;
+        font-size: 11px;
+        color: #9fb0d0;
+      }
+      #status.ok {
+        color: #8aff9c;
+      }
+      #status.warn {
+        color: #ff8a8a;
+      }
+      #newroot {
+        display: none;
+        color: #8aff9c;
+        border-color: #3a784a;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <h1>EM Proofreading — Phase B</h1>
+      <div class="row">
+        <input id="cellid" placeholder="root id" style="width: 220px" />
+        <button id="loadcell">load cell</button>
+      </div>
+      <div id="anncount"></div>
+      <table>
+        <thead>
+          <tr>
+            <th style="width: 32px">#</th>
+            <th>type</th>
+            <th>position (µm)</th>
+            <th>supervoxel</th>
+            <th style="width: 100px">edit</th>
+            <th style="width: 80px">status</th>
+          </tr>
+        </thead>
+        <tbody id="anntbody">
+          <tr>
+            <td colspan="5" style="color: #9fb0d0; text-align: center; padding: 14px">
+              loading…
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="row" style="margin-top: 16px">
+        <button id="resolve">resolve supervoxels</button>
+        <button id="newroot">—</button>
+      </div>
+      <div id="status">connecting…</div>
+    </div>
+    <script type="module" src="/src/review.ts"></script>
+  </body>
+</html>
