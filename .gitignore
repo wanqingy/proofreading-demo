@@ -8,5 +8,6 @@ __pycache__/
 .venv/
 .ipynb_checkpoints/
 
-# proofreading session write-ahead logs (annotation data, not code)
-proofread_sessions/
+# proofreading session write-ahead logs — track WAL files, ignore large caches
+proofread_sessions/tube_cache/
+proofread_sessions/renders/
