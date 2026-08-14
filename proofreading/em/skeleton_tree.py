@@ -179,6 +179,27 @@ class SkeletonTree:
             mask[v] = False
         return mask
 
+    def path_between(self, u: int, v: int) -> np.ndarray:
+        """Ordered vertex indices from ``u`` to ``v`` via their lowest common ancestor.
+
+        Used to join two arbitrary points along the tree into a polyline (e.g. a myelin
+        interval's start/end vertices, which need not lie on the same branch path).
+        """
+        u, v = int(u), int(v)
+        up = [u]
+        a = u
+        while not self.is_descendant(v, a):
+            a = int(self.parent[a])
+            up.append(a)
+        lca = a
+        down: List[int] = []
+        b = v
+        while b != lca:
+            down.append(b)
+            b = int(self.parent[b])
+        down.reverse()
+        return np.array(up + down, dtype=np.int64)
+
     # ------------------------------------------------------------------ #
     # vertex <-> L2 id mapping
     # ------------------------------------------------------------------ #

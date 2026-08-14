@@ -18,6 +18,12 @@ from typing import Optional
 
 import numpy as np
 
+# Must run before ANY CAVEclient / CloudVolume / GCS client is constructed (they bind their
+# connection pool at creation), hence at import time here rather than inside EMClient.__init__.
+from ._http_pool import tune_connection_pool
+
+tune_connection_pool()
+
 DEFAULT_DATASTACK = "minnie65_phase3_v1"  # live, proofreadable; minnie65_public = sandbox
 
 

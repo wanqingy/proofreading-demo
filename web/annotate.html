@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Proofreading recorder</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: #000;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+      /* neuroglancer attaches here (makeMinimalViewer's default target id) */
+      #neuroglancer-container {
+        position: absolute;
+        inset: 0;
+      }
+      /* horizontal bar along the bottom, out of the way of neuroglancer's own layer panel */
+      #hud {
+        position: absolute;
+        left: 10px;
+        right: 10px;
+        bottom: 10px;
+        z-index: 10000;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        background: rgba(0, 0, 0, 0.85);
+        color: #d7e3ff;
+        padding: 6px 10px;
+        border: 1px solid #2c3a5a;
+        border-radius: 8px;
+        font-size: 12px;
+        height: 34px;
+        user-select: none;
+      }
+      #hud h1 {
+        font-size: 11px;
+        margin: 0;
+        color: #7fa8ff;
+        letter-spacing: 0.04em;
+        white-space: nowrap;
+        flex: none;
+      }
+      #hud button {
+        background: #1c2740;
+        color: #d7e3ff;
+        border: 1px solid #3a4d78;
+        border-radius: 5px;
+        padding: 4px 10px;
+        cursor: pointer;
+        font: inherit;
+        white-space: nowrap;
+        flex: none;
+      }
+      #hud button:hover {
+        background: #28365a;
+      }
+      #hud button:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      #username {
+        width: 90px;
+        flex: none;
+        background: #1c2740;
+        color: #d7e3ff;
+        border: 1px solid #3a4d78;
+        border-radius: 5px;
+        padding: 4px 6px;
+        font: inherit;
+        font-size: 11px;
+      }
+      #record {
+        font-weight: bold;
+        background: #1a3a22;
+        border-color: #3a784a;
+        color: #8aff9c;
+      }
+      #record:hover {
+        background: #234a2c;
+      }
+      #help {
+        width: 20px;
+        padding: 4px 0;
+        border-radius: 50%;
+      }
+      #canceledit {
+        display: none;
+        color: #ff8a8a;
+        border-color: #6a3a3a;
+      }
+      #status {
+        color: #9fb0d0;
+        font-size: 11px;
+        white-space: nowrap;
+        flex: none;
+        max-width: 260px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      #status.ok {
+        color: #8aff9c;
+      }
+      #status.warn {
+        color: #ff8a8a;
+      }
+      #divider {
+        width: 1px;
+        align-self: stretch;
+        background: #2c3a5a;
+        flex: none;
+      }
+      /* recorded neurites: a single dropdown instead of a growing row of chips */
+      #neurites {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        flex: 1;
+        min-width: 0;
+      }
+      #neuriteselect {
+        flex: 1;
+        min-width: 0;
+        background: #1c2740;
+        color: #d7e3ff;
+        border: 1px solid #3a4d78;
+        border-radius: 5px;
+        padding: 4px 6px;
+        font: inherit;
+        font-size: 11px;
+      }
+      #neuriteselect:disabled {
+        opacity: 0.5;
+      }
+      #neurites button[data-action="delete"] {
+        color: #ff8a8a;
+      }
+      /* legend: hidden popover above the bar, toggled by the "?" button */
+      #legend {
+        display: none;
+        position: absolute;
+        left: 0;
+        bottom: 42px;
+        z-index: 10001;
+        background: rgba(0, 0, 0, 0.9);
+        color: #7f8db0;
+        border: 1px solid #2c3a5a;
+        border-radius: 8px;
+        padding: 10px 12px;
+        font-size: 11px;
+        line-height: 1.5;
+        width: 340px;
+      }
+      #legend.shown {
+        display: block;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="neuroglancer-container"></div>
+    <div id="hud">
+      <h1>PROOFREADING</h1>
+      <input id="username" placeholder="your name" title="attributed on each recording (not verified)" />
+      <button id="record">● Record</button>
+      <button id="canceledit">cancel edit</button>
+      <button id="help" title="help">?</button>
+      <div id="legend">
+        Select all segments belonging to one neurite in the segmentation layer. Optionally
+        drop annotation points linked to a segment (right-click a segment → "Add annotation
+        linked to segment") with a description to leave a note. Hit Record to save the
+        neurite (id assigned automatically) — segments, notes, and the current view link are
+        captured in one shot.<br /><br />
+        Pick a recorded neurite from the dropdown, then: <b style="color:#d7e3ff">open</b> its
+        captured view read-only in a new tab; <b style="color:#d7e3ff">edit</b> reopens it in
+        THIS tab for editing (Record becomes "Update #N" — re-capture to overwrite it in
+        place); <b style="color:#d7e3ff">del</b> deletes it permanently.
+      </div>
+      <div id="status">connecting…</div>
+      <div id="divider"></div>
+      <div id="neurites">
+        <select id="neuriteselect" disabled>
+          <option>no neurites recorded yet</option>
+        </select>
+        <button id="neuriteopen" title="open in new tab">open</button>
+        <button id="neuriteedit" title="edit in this tab">edit</button>
+        <button id="neuritedelete" data-action="delete" title="delete">del</button>
+      </div>
+    </div>
+    <script>
+      function __annErr(msg) {
+        var s = document.getElementById("status");
+        if (s) {
+          s.textContent = "✗ " + msg;
+          s.className = "warn";
+        }
+      }
+      window.addEventListener("error", function (e) {
+        __annErr(
+          (e.message || e.error) +
+            (e.filename ? " @ " + String(e.filename).split("/").pop() + ":" + e.lineno : ""),
+        );
+        console.error("[annotate] error", e.error || e.message);
+      });
+      window.addEventListener("unhandledrejection", function (e) {
+        var r = e.reason;
+        __annErr("promise: " + (r && (r.stack || r.message || r)));
+        console.error("[annotate] unhandledrejection", r);
+      });
+    </script>
+    <script type="module" src="/src/annotate.ts"></script>
+  </body>
+</html>

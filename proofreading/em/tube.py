@@ -243,7 +243,30 @@ def _open_shared(src, cache_dir: str, name: str, data_type: str = "uint8"):
     return local, src
 
 
-def _fill_chunks(local, src, points_nm, radius_nm, transform, workers, budget_s) -> tuple:
+def branch_marker_state(markers_dir, path_id, em_mip, tgt_mip) -> tuple:
+    """``(em_done, tgt_done)`` for one branch, honoring the legacy single marker.
+
+    Markers are per PHASE and the mask's is keyed by its mip, because the mask resolution is
+    configurable (see :attr:`CellTube.DEFAULT_TGT_MIP`): a single ``path_N.done`` cannot express
+    "em is built, and the mask is built *at this resolution*". With one shared marker, lowering
+    the mask mip made every already-built branch skip its fill entirely, leaving the new mask
+    volume empty (all chunk requests 404 -> no overlay at all).
+
+    The legacy ``path_N.done`` predates configurable mask mips, when the mask was always built at
+    the EM mip -- so it counts as both phases done only when ``tgt_mip == em_mip``, and otherwise
+    only as the em phase (so switching mips refetches just the mask, not the imagery).
+    """
+    pid = int(path_id)
+    legacy = os.path.exists(os.path.join(markers_dir, f"path_{pid}.done"))
+    em_done = legacy or os.path.exists(os.path.join(markers_dir, f"path_{pid}.em.done"))
+    tgt_done = os.path.exists(os.path.join(markers_dir, f"path_{pid}.tgt{int(tgt_mip)}.done")) or (
+        legacy and int(tgt_mip) == int(em_mip)
+    )
+    return em_done, tgt_done
+
+
+def _fill_chunks(local, src, points_nm, radius_nm, transform, workers, budget_s,
+                 on_progress=None) -> tuple:
     """Copy the tube's chunks from ``src`` into ``local`` (parallel). Returns (bytes, fails, n).
 
     ``budget_s`` caps the WHOLE copy: the tube data is served from one host (GCS), whose HTTP
@@ -252,6 +275,10 @@ def _fill_chunks(local, src, points_nm, radius_nm, transform, workers, budget_s)
     branches). We wait on the reads with an overall deadline and, on timeout, count the still-
     pending boxes as failed and ``shutdown(wait=False)`` so the request RETURNS (the leaked
     worker(s) unwedge on their own; the branch isn't marked ``.done`` -> retried next visit).
+
+    ``on_progress(done, total)`` fires as each chunk lands, so callers can distinguish "slowly
+    working through a big branch" from "wedged" -- a distinction the per-branch ``.done`` marker
+    alone can't make (it only flips at the very end).
     """
     res = np.asarray(src.resolution, dtype=np.int64)
     b = src.bounds
@@ -276,6 +303,8 @@ def _fill_chunks(local, src, points_nm, radius_nm, transform, workers, budget_s)
     ex = ThreadPoolExecutor(max_workers=workers)
     futs = [ex.submit(work, box) for box in boxes]
     nbytes = fails = done = 0
+    if on_progress:
+        on_progress(0, len(boxes))
     try:
         for f in as_completed(futs, timeout=budget_s):
             done += 1
@@ -284,6 +313,8 @@ def _fill_chunks(local, src, points_nm, radius_nm, transform, workers, budget_s)
                 nbytes += s
             elif s < 0:
                 fails += 1
+            if on_progress:
+                on_progress(done, len(boxes))
     except _FuturesTimeout:
         fails += len(futs) - done  # the reads still pending at the deadline (likely wedged)
     finally:
@@ -305,48 +336,106 @@ class CellTube:
     em_name = "em"
     tgt_name = "tgt"
 
-    def __init__(self, emclient, root_id, mip, radius_nm, cache_dir):
+    # The target mask is a translucent "does this voxel belong to the cell" tint, so it does NOT
+    # need the EM's resolution -- and fetching it at the EM mip dominates build time. The seg's
+    # native chunk is 256x256x32 uint64 (16.8 MB) at mips 1-3 and only shrinks to 128x128x16
+    # (2.1 MB) at mip4, which is why mip4 (not mip3) is where the big win is. Neuroglancer
+    # registers layers by their declared resolution + voxel_offset, so a coarser mask lines up
+    # with the 16nm EM in world space with no resampling on our side.
+    #
+    # Measured, minnie65_public branch 15 (an AXON -- the thinnest structure, worst case for
+    # downsampling). "coverage" = fraction of skeleton centerline vertices the mask marks:
+    #   mip1 (16x16x40):   tgt phase 144s, 376 MB   coverage --
+    #   mip2 (32x32x40):   tgt phase 101s, 142 MB   coverage 100%
+    #   mip3 (64x64x40):   tgt phase  88s,  69 MB   coverage  84%
+    #   mip4 (128x128x80): tgt phase  42s,  26 MB   coverage  68%   <- default
+    # mip4 is the deliberate speed-first choice: whole-cell caching ~33 min instead of ~86, at
+    # the cost of the tint missing roughly a third of a thin axon's centerline. Treat it as an
+    # orientation cue, not a reliable cell boundary; raise PROOFREAD_TGT_MIP (2 = full fidelity)
+    # for a cell where that matters.
+    DEFAULT_TGT_MIP = int(os.environ.get("PROOFREAD_TGT_MIP", "4"))
+
+    def __init__(self, emclient, root_id, mip, radius_nm, cache_dir, tgt_mip=None):
         self.root = int(root_id)
         self.mip = int(mip)
+        self.tgt_mip = int(self.DEFAULT_TGT_MIP if tgt_mip is None else tgt_mip)
         self.radius_nm = float(radius_nm)
         self.cache_dir = os.path.abspath(cache_dir)
         os.makedirs(self.cache_dir, exist_ok=True)
         self.em_local, self.em_src = _open_shared(
             emclient.image_cloudvolume(self.mip), self.cache_dir, self.em_name
         )
+        # NOTE: the mask volume is keyed by its mip in the directory name -- changing the mip
+        # must not append coarse chunks into a volume whose `info` declares a finer resolution.
+        tgt_dir = self.tgt_name if self.tgt_mip == self.mip else f"{self.tgt_name}_mip{self.tgt_mip}"
+        self.tgt_name_dir = tgt_dir
         self.tgt_local, self.tgt_src = _open_shared(
-            emclient.agg_seg_cv(self.mip), self.cache_dir, self.tgt_name
+            emclient.agg_seg_cv(self.tgt_mip), self.cache_dir, tgt_dir
         )
         self._markers = os.path.join(self.cache_dir, "_branches")
         os.makedirs(self._markers, exist_ok=True)
 
-    def fill_branch(self, path_id, points_nm, *, workers: int = 8, budget_s: float = 360.0,
-                    force: bool = False, verbose: bool = True) -> None:
+    def marker_state(self, path_id) -> tuple:
+        """``(em_done, tgt_done)`` for this branch at THIS instance's mask mip."""
+        return branch_marker_state(self._markers, path_id, self.mip, self.tgt_mip)
+
+    def branch_done(self, path_id) -> bool:
+        return all(self.marker_state(path_id))
+
+    def fill_branch(self, path_id, points_nm, *, workers: int = 16, budget_s: float = 360.0,
+                    force: bool = False, verbose: bool = True, on_progress=None) -> None:
         """Write this branch's tube chunks into the shared volumes (skips if already done).
 
-        EM and target are filled SEQUENTIALLY (not 2 concurrent executors) so the peak concurrent
-        reads stay at ``workers`` -- both volumes live on the same host (GCS) whose connection pool
-        is only ~10, and exceeding it thrashed the pool + hung long branches. ``budget_s`` bounds
-        each fill (see :func:`_fill_chunks`) so a wedged read can't hang the build indefinitely.
+        EM and target are filled SEQUENTIALLY (not 2 concurrent executors) to keep the peak
+        request count in hand. Concurrent GCS requests per fill is
+        ``workers x native-chunks-per-64^3-box``, measured on minnie65_public mip1 as:
+        EM native chunk is exactly 64^3 -> **1** per box; agg-seg native chunk is 256x256x32,
+        and our boxes are aligned to the same origin, so 64 in z -> **2** per box. So a fill
+        uses ``workers`` (em) to ``2 x workers`` (tgt) connections.
+
+        At the old ``workers=2`` that was just 2-4 connections -- far under the 64-connection
+        ceiling (:mod:`proofreading.em._http_pool`) and slow enough that a ~1400-chunk branch
+        could not finish inside ``budget_s`` at all. 16 gives 16-32, still inside the ceiling
+        even with a second fill running concurrently.
+
+        ``budget_s`` bounds each fill (see :func:`_fill_chunks`) so a wedged read can't hang the
+        build indefinitely. ``on_progress(phase, done, total)`` reports chunk-level progress
+        ("em" then "tgt") for a live caching indicator.
         """
-        marker = os.path.join(self._markers, f"path_{int(path_id)}.done")
-        if not force and os.path.exists(marker):
+        pid = int(path_id)
+        em_done, tgt_done = self.marker_state(pid)
+        if not force and em_done and tgt_done:
             if verbose:
-                print(f"tube path_{int(path_id)}: cached", flush=True)
+                print(f"tube path_{pid}: cached", flush=True)
             return
         rs = P.resample_path(np.asarray(points_nm, dtype=float), 256.0)
         root = self.root
         tint = lambda d: ((np.asarray(d) == np.uint64(root)) * 255).astype(np.uint8)
         t0 = time.time()
-        em_b, em_f, em_n = _fill_chunks(self.em_local, self.em_src, rs, self.radius_nm, None, workers, budget_s)
-        tg_b, tg_f, tg_n = _fill_chunks(self.tgt_local, self.tgt_src, rs, self.radius_nm, tint, workers, budget_s)
-        dt = time.time() - t0
-        if em_f == 0 and tg_f == 0:  # mark complete so revisiting this branch skips
+        cb = (lambda phase: (lambda d, t: on_progress(phase, d, t))) if on_progress else (lambda _p: None)
+
+        def _mark(name: str) -> None:
             try:
-                with open(marker, "w") as fh:
+                with open(os.path.join(self._markers, name), "w") as fh:
                     fh.write(str(time.time()))
             except Exception:
                 pass
+
+        # Each phase is skipped and marked INDEPENDENTLY, so changing the mask mip refetches only
+        # the mask, and a phase that failed last time isn't re-done alongside one that succeeded.
+        em_b = em_f = em_n = 0
+        if force or not em_done:
+            em_b, em_f, em_n = _fill_chunks(self.em_local, self.em_src, rs, self.radius_nm, None,
+                                            workers, budget_s, on_progress=cb("em"))
+            if em_f == 0:
+                _mark(f"path_{pid}.em.done")
+        tg_b = tg_f = tg_n = 0
+        if force or not tgt_done:
+            tg_b, tg_f, tg_n = _fill_chunks(self.tgt_local, self.tgt_src, rs, self.radius_nm, tint,
+                                            workers, budget_s, on_progress=cb("tgt"))
+            if tg_f == 0:
+                _mark(f"path_{pid}.tgt{self.tgt_mip}.done")
+        dt = time.time() - t0
         if verbose:
             print(f"tube path_{int(path_id)}: {em_n + tg_n} chunks  "
                   f"{(em_b + tg_b) / 1e6:.0f} MB  {dt:.1f}s"

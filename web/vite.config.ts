@@ -1,3 +1,4 @@
+import { resolve } from "path";
 import { defineConfig } from "vite";
 
 // Phase 0 spike build config.
@@ -36,7 +37,20 @@ export default defineConfig({
     ],
   },
   worker: { format: "es" },
-  server: { port: 5173, strictPort: false },
+  // strictPort: true -- the Brainmaps OAuth client's redirect URI is registered for this
+  // exact port; silently falling back to another port (e.g. if 5173 is already taken by a
+  // stale process) would break Google sign-in with a redirect_uri_mismatch.
+  server: { port: 5173, strictPort: true },
+  build: {
+    rollupOptions: {
+      input: {
+        main: resolve(__dirname, "index.html"),
+        review: resolve(__dirname, "review.html"),
+        annotate: resolve(__dirname, "annotate.html"),
+        myelin: resolve(__dirname, "myelin.html"),
+      },
+    },
+  },
   // neuroglancer references a handful of optional build-time globals as bare identifiers
   // (all behind `typeof ... !== "undefined"` guards). Define them as `undefined` so the
   // guards take the default branch instead of throwing ReferenceError.
@@ -49,6 +63,13 @@ export default defineConfig({
     NEUROGLANCER_CREDIT_LINK: "undefined",
     NEUROGLANCER_GOOGLE_TAG_MANAGER: "undefined",
     NEUROGLANCER_BRAINMAPS_SERVERS: "undefined",
-    NEUROGLANCER_BRAINMAPS_CLIENT_ID: "undefined",
+    // Our own OAuth client (GCP project under wanqing.yu@alleninstitute.org), with
+    // http://localhost:5173/node_modules/neuroglancer/lib/util/google_oauth2_redirect.html
+    // registered as an authorized redirect URI. (A borrowed public client id won't work here --
+    // neuroglancer computes redirect_uri relative to wherever its own JS is served from, so it
+    // must be registered against this exact dev-server origin+path.)
+    NEUROGLANCER_BRAINMAPS_CLIENT_ID: JSON.stringify(
+      "821726826091-jpe3e3se4tqbgclnojfkucsp6aiteh0s.apps.googleusercontent.com",
+    ),
   },
 });

@@ -49,6 +49,9 @@ The distal subtree pruned from review when a `merge error` is dropped — branch
 **WAL** (write-ahead log):
 The local append-only JSONL file that is the session source of truth. The in-memory annotation list and the neuroglancer layers are *views* of it; recovery = replay the log. Deletes are tombstone events.
 
+**Myelin tag**:
+The SAME shape as a **Tag** — one discrete, deliberate point per action, snapped to the nearest true skeleton vertex — but a separate vocabulary and a separate WAL file (`myelin_tag`/`myelin_tag_tombstone`, never a fifth **Tag**). Presence of a myelin tag on a node means myelinated; absence means the unmyelinated default. Because it's a real annotation (not a derived interval), it's browsable and deletable in neuroglancer's own Annotations panel, not just through this tool's own UI.
+
 ## Relationships
 
 - A **cell**'s durable identity is a **seed supervoxel**; its **root id** is a transient per-session handle.
@@ -57,6 +60,7 @@ The local append-only JSONL file that is the session source of truth. The in-mem
 - A **branch path** is a sequence of L2-skeleton vertices, each mapping to an **L2 id**; it is `covered` once its L2 ids are visited.
 - A **merge error** annotation terminates its branch-path fly-through early and prunes the distal **omitted subtree** from coverage.
 - An **edit** changes the **root id** and the **L2 ids** of touched chunks; **supervoxel ids** never change.
+- A **myelin toggle** pair (on + off) derives one **myelin interval**; an unmatched "on" is a dangling toggle (a crash or closed tab), surfaced but not guessed at.
 
 ## Example dialogue
 

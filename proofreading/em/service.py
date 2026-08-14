@@ -30,7 +30,7 @@ import numpy as np
 from . import path as P
 from .coverage import Coverage
 from .skeleton_tree import SkeletonTree
-from .tube import CellTube
+from .tube import CellTube, branch_marker_state
 from .wal import WAL
 
 # per-vertex compartment codes from the skeleton service
@@ -51,12 +51,14 @@ class CellReviewService:
         tube_radius_nm: float = 1000.0,
         orient_to_path: bool = False,
         prebuild_ahead: int = 2,
+        tgt_mip: int | None = None,  # None -> CellTube.DEFAULT_TGT_MIP (coarse; see tube.py)
     ):
         self.client = emclient
         self.root_id = int(root_id)
         self.datastack = emclient.datastack
         self.step_nm = float(step_nm)
         self.tube_mip = int(tube_mip)
+        self.tgt_mip = None if tgt_mip is None else int(tgt_mip)
         self.tube_radius_nm = float(tube_radius_nm)
         self.orient_to_path = bool(orient_to_path)
 
@@ -74,6 +76,12 @@ class CellReviewService:
         self.wal = WAL.for_cell(wal_dir, self.datastack, self.seed)
         _state = WAL.load(self.wal.path)
         self.coverage = Coverage.from_wal_state(_state)
+        # myelin events live in a SEPARATE file from the review tags above (different tool,
+        # different vocabulary -- see wal.py's `for_cell` docstring), so myelin review progress
+        # is resumed from its own log; no omission concept for this coverage dimension.
+        self.myelin_wal = WAL.for_cell(wal_dir, self.datastack, self.seed, kind="myelin")
+        _myelin_state = WAL.load(self.myelin_wal.path)
+        self.myelin_coverage = Coverage(visited_l2=set(_myelin_state.myelin_visited_l2))
         self._resume_root_xyz = _state.root_xyz  # re-applied at the end of __init__ (below)
 
         self.tube_cache_dir = os.path.join(
@@ -94,6 +102,16 @@ class CellReviewService:
         self._prebuild_ex = ThreadPoolExecutor(max_workers=1, thread_name_prefix="prebuild")
         self._prebuilding: set[int] = set()
         self._prebuild_lock = threading.Lock()
+        # live chunk-level fill progress, path_id -> {phase, done, total, ts}. Lets the UI show a
+        # real caching bar and, via `ts`, tell "slowly working a big branch" from "wedged read"
+        # -- the .done marker alone can't, since it only flips at the very end of a branch.
+        self._fill_progress: dict[int, dict] = {}
+        self._fill_progress_lock = threading.Lock()
+        # Monotonic count of chunks fetched this session. The per-fill numbers above are NOT
+        # monotonic -- they reset when a branch switches em->tgt phase, and the set of active
+        # fills shrinks as branches finish -- so a total that only ever increases is what
+        # actually answers "is it still making progress or is it wedged?".
+        self._chunks_cached = 0
         self._epoch = 0  # bumped on re-root so stale in-flight pre-builds abort
 
         # resume a previously chosen review root (persisted set_root). xyz is resolution-independent
@@ -113,14 +131,22 @@ class CellReviewService:
                 if self._tube is None:
                     self._tube = CellTube(
                         self.client, self.root_id, self.tube_mip,
-                        self.tube_radius_nm, self.tube_cache_dir,
+                        self.tube_radius_nm, self.tube_cache_dir, tgt_mip=self.tgt_mip,
                     )
         return self._tube
 
     def _branch_done(self, path_id: int) -> bool:
-        return os.path.exists(
-            os.path.join(self.tube_cache_dir, "_branches", f"path_{int(path_id)}.done")
-        )
+        """Fully built for the CURRENT config -- em AND the mask at the mask mip in effect.
+
+        Deliberately not just "a marker exists": the mask resolution is configurable, so a branch
+        built under a different mask mip is NOT done for this session (its mask volume has no
+        chunks). Reads markers off disk rather than via ``ensure_tube()`` so the branch checklist
+        doesn't force CloudVolume construction. See :func:`tube.branch_marker_state`.
+        """
+        tgt_mip = CellTube.DEFAULT_TGT_MIP if self.tgt_mip is None else self.tgt_mip
+        return all(branch_marker_state(
+            os.path.join(self.tube_cache_dir, "_branches"), path_id, self.tube_mip, tgt_mip,
+        ))
 
     # ------------------------------------------------------------------ #
     # branches (M4.3: ordered proximal -> distal, the guidebook sweep)
@@ -222,6 +248,7 @@ class CellReviewService:
         return {
             "path_id": int(bp.id),
             "state": self.coverage.path_state(self.tree, bp),
+            "myelin_state": self.myelin_coverage.path_state(self.tree, bp),
             "n_nodes": int(len(bp.vertices)),
             "length_nm": round(length_nm, 1),
             "compartment": comp,
@@ -231,17 +258,33 @@ class CellReviewService:
             "dist_to_root_nm": round(float(self._dist_to_root()[int(bp.vertices[0])]), 1),
         }
 
-    def branches(self) -> dict:
-        # ordered proximal -> distal so the checklist + auto-advance sweep the cell soma-outward
+    @staticmethod
+    def _tally_myelin_state(metas: list[dict]) -> dict:
+        counts = {"to_review": 0, "covered": 0, "omitted": 0}
+        for m in metas:
+            counts[m["myelin_state"]] += 1
+        return counts
+
+    def branches(self, compartment: str | None = None) -> dict:
+        # ordered proximal -> distal so the checklist + auto-advance sweep the cell soma-outward.
+        # `compartment` (e.g. "axon") restricts the checklist to branches of that dominant type --
+        # used by the myelin fly-through, which should only ever offer axon branches.
+        all_metas = [self.branch_metadata(i) for i in self._branch_order()]
+        metas = [m for m in all_metas if m["compartment"] == compartment] if compartment else all_metas
+        # myelin_summary is always scoped to axon branches (the only ones this dimension ever
+        # covers), regardless of `compartment` -- otherwise "done" could never reach 0, since
+        # dendrite/soma branches are never myelin-reviewed.
+        axon_metas = [m for m in all_metas if m["compartment"] == "axon"]
         return {
-            "branches": [self.branch_metadata(i) for i in self._branch_order()],
+            "branches": metas,
             "summary": self.coverage.summary(self.tree),
+            "myelin_summary": self._tally_myelin_state(axon_metas),
         }
 
     # ------------------------------------------------------------------ #
     # camera path (+ build the branch tube)
     # ------------------------------------------------------------------ #
-    def camera_path(self, path_id: int, orient: bool | None = None) -> dict:
+    def camera_path(self, path_id: int, orient: bool | None = None, compartment: str | None = None) -> dict:
         """Resample the branch into a camera path and ensure its tube chunks are cached.
 
         Returns the camera payload with the tube volume names as *relative* paths
@@ -262,20 +305,28 @@ class CellReviewService:
         with self._branch_locks[pid]:
             cached = self._branch_done(pid)
             t0 = time.time()
-            tube.fill_branch(pid, verts_nm, verbose=False)  # raw verts; resamples internally
+            try:
+                # raw verts; resamples internally
+                tube.fill_branch(pid, verts_nm, verbose=False, on_progress=self._progress_cb(pid))
+            finally:
+                self._clear_progress(pid)
             seconds = round(time.time() - t0, 1)
 
         rel = f"tube/{self.datastack}/{self.root_id}"
-        prebuilding = self._queue_prebuild(pid)  # build the next to-review branch(es) in the bg
+        # build the next to-review branch(es) in the bg, in the SAME sequence the caller is
+        # actually reviewing (see _queue_prebuild's docstring)
+        prebuilding = self._queue_prebuild(pid, compartment=compartment)
         return {
             "path_id": pid,
             "root_id": str(self.root_id),  # string: exceeds JS 2^53 safe-int range
             "resolution_nm": [int(x) for x in self.res],
             "points_nm": rs.tolist(),
+            "nodes_nm": verts_nm.tolist(),  # TRUE skeleton vertices (sparse) vs. the resampled points_nm
             "orientations": orientations,
             "step_nm": self.step_nm,
             "em_rel": f"{rel}/{tube.em_name}",
-            "tgt_rel": f"{rel}/{tube.tgt_name}",
+            # mask lives in a mip-keyed directory (see CellTube.__init__), NOT always "tgt"
+            "tgt_rel": f"{rel}/{tube.tgt_name_dir}",
             "build": {"cached": bool(cached), "seconds": seconds},
             "prebuilding": prebuilding,
         }
@@ -283,12 +334,29 @@ class CellReviewService:
     # ------------------------------------------------------------------ #
     # background pre-build (M4: hide the next branch's build behind review time)
     # ------------------------------------------------------------------ #
-    def _queue_prebuild(self, after_path_id: int) -> list[int]:
+    def _queue_prebuild(self, after_path_id: int, compartment: str | None = None) -> list[int]:
         """Queue background builds of the next to-review branch(es) (proximal->distal) after the
-        current one. Returns the path ids queued (for an optional HUD hint)."""
+        current one. Returns the path ids queued (for an optional HUD hint).
+
+        ``compartment`` scopes this to the SAME sequence the caller is actually navigating.
+        Without it, this walks the full, unfiltered branch order using the error-review
+        coverage (``self.coverage``) -- correct for main.ts's unfiltered sweep, but WRONG for
+        the myelin fly-through, which only ever visits axon branches in myelin-coverage order:
+        prebuilding from the unfiltered order would almost always guess a branch the myelin
+        tool was never going to load next (a dendrite branch, or an axon branch it already
+        marked myelin-covered), wasting the one background worker while the branch actually
+        coming up next builds on-demand instead. ``compartment="axon"`` switches both the
+        candidate list and the coverage dimension checked to ``myelin_coverage``, matching
+        ``branches(compartment="axon")``/``myelin_mark_done``'s own axon-scoped sequence.
+        """
         if self.prebuild_ahead <= 0:
             return []
-        order = self._branch_order()
+        all_metas = {pid: self.branch_metadata(pid) for pid in self._branch_order()}
+        order = [
+            pid for pid in self._branch_order()
+            if compartment is None or all_metas[pid]["compartment"] == compartment
+        ]
+        state_key = "myelin_state" if compartment == "axon" else "state"
         try:
             start = order.index(int(after_path_id)) + 1
         except ValueError:
@@ -297,8 +365,7 @@ class CellReviewService:
         for pid in order[start:]:
             if len(queued) >= self.prebuild_ahead:
                 break
-            bp = self.tree.branch_paths[pid]
-            if self.coverage.path_state(self.tree, bp) != "to_review" or self._branch_done(pid):
+            if all_metas[pid][state_key] != "to_review" or self._branch_done(pid):
                 continue
             with self._prebuild_lock:
                 if pid in self._prebuilding:
@@ -307,6 +374,81 @@ class CellReviewService:
             self._prebuild_ex.submit(self._prebuild, pid, self._epoch)
             queued.append(int(pid))
         return queued
+
+    def _progress_cb(self, path_id: int):
+        """Build an ``on_progress`` callback that records this branch's live fill progress."""
+        pid = int(path_id)
+
+        def cb(phase: str, done: int, total: int) -> None:
+            with self._fill_progress_lock:
+                prev = self._fill_progress.get(pid)
+                # accumulate the DELTA so the running total stays monotonic across the em->tgt
+                # phase switch (which restarts `done` at 0 against a different total)
+                prev_done = prev["done"] if prev and prev["phase"] == phase else 0
+                self._chunks_cached += max(0, int(done) - prev_done)
+                self._fill_progress[pid] = {
+                    "phase": phase, "done": int(done), "total": int(total), "ts": time.time(),
+                }
+
+        return cb
+
+    def _clear_progress(self, path_id: int) -> None:
+        with self._fill_progress_lock:
+            self._fill_progress.pop(int(path_id), None)
+
+    def warm_status(self) -> dict:
+        """Live caching progress: what's filling right now, how far along, and how long since it
+        last advanced (``stalled_s``) so the UI can flag a wedged read rather than just spinning.
+        """
+        now = time.time()
+        with self._fill_progress_lock:
+            active = [
+                {"path_id": pid, **p, "stalled_s": round(now - p["ts"], 1)}
+                for pid, p in self._fill_progress.items()
+            ]
+        for a in active:
+            a.pop("ts", None)
+        active.sort(key=lambda a: a["path_id"])
+        with self._prebuild_lock:
+            queued = len(self._prebuilding)
+        return {
+            "active": active,
+            "in_flight": queued,
+            "chunks_cached": self._chunks_cached,  # monotonic; the reliable "still alive" signal
+        }
+
+    def warm_cell(self, compartment: str | None = None) -> dict:
+        """Queue background tube builds for EVERY remaining to-review branch, not just the next
+        ``prebuild_ahead``.
+
+        Same machinery as :meth:`_queue_prebuild` with the lookahead cap lifted -- it already
+        skips branches that are built / not to-review / in flight, and :meth:`_prebuild` already
+        aborts stale work after a re-root (``_epoch``). The single-worker ``_prebuild_ex`` keeps
+        these serial so a long warm-up can't starve the on-demand fetch the user is waiting on;
+        the point is that it runs AHEAD of time, not that it runs wider.
+        """
+        all_metas = {pid: self.branch_metadata(pid) for pid in self._branch_order()}
+        order = [
+            pid for pid in self._branch_order()
+            if compartment is None or all_metas[pid]["compartment"] == compartment
+        ]
+        state_key = "myelin_state" if compartment == "axon" else "state"
+        queued: list[int] = []
+        already_built = 0
+        for pid in order:
+            if self._branch_done(pid):
+                already_built += 1
+                continue
+            if all_metas[pid][state_key] != "to_review":
+                continue
+            with self._prebuild_lock:
+                if pid in self._prebuilding:
+                    continue
+                self._prebuilding.add(pid)
+            self._prebuild_ex.submit(self._prebuild, pid, self._epoch)
+            queued.append(int(pid))
+        return {"queued": queued, "n_queued": len(queued),
+                "already_built": already_built, "total": len(order)}
 
     def _prebuild(self, path_id: int, epoch: int) -> None:
         """Background worker: build one branch's tube unless a re-root (epoch bump) invalidated it.
@@ -326,17 +468,22 @@ class CellReviewService:
                     return
                 bp = self.tree.branch_paths[pid]
                 verts = np.asarray(self.tree.vertices[bp.vertices], dtype=float)
-                tube.fill_branch(pid, verts, verbose=False)
+                tube.fill_branch(pid, verts, verbose=False, on_progress=self._progress_cb(pid))
                 if epoch != self._epoch:
-                    # re-rooted DURING the fill: this .done is for the OLD decomposition -> drop it
-                    # inside the lock, before any on-demand fetch can see it
-                    try:
-                        os.remove(os.path.join(self.tube_cache_dir, "_branches", f"path_{pid}.done"))
-                    except OSError:
-                        pass
+                    # re-rooted DURING the fill: these markers are for the OLD decomposition ->
+                    # drop them inside the lock, before any on-demand fetch can see them. All
+                    # per-phase variants, not just the legacy name (see tube.branch_marker_state).
+                    mdir = os.path.join(self.tube_cache_dir, "_branches")
+                    for name in (f"path_{pid}.done", f"path_{pid}.em.done",
+                                 f"path_{pid}.tgt{tube.tgt_mip}.done"):
+                        try:
+                            os.remove(os.path.join(mdir, name))
+                        except OSError:
+                            pass
         except Exception:
             pass  # best-effort; an on-demand fetch will build it if needed
         finally:
+            self._clear_progress(pid)
             with self._prebuild_lock:
                 self._prebuilding.discard(pid)
 
@@ -359,6 +506,44 @@ class CellReviewService:
         """
         ann = self.wal.add_annotation(tag, xyz_nm, self.root_id, self.mat_version, self.seed)
         return {"annotation": self._ann(ann), "summary": self.coverage.summary(self.tree)}
+
+    # ------------------------------------------------------------------ #
+    # myelin tags -- a discrete, per-NODE tag ("myelinated"), same shape as the review Tags
+    # but a separate vocabulary/file (see CONTEXT.md, wal.py's module docstring). Presence of
+    # a tag on a node means myelinated; absence means the unmyelinated default.
+    # ------------------------------------------------------------------ #
+    def tag_myelinated_node(self, xyz_nm, path_id: int | None = None) -> dict:
+        """Tag the single skeleton vertex nearest ``xyz_nm`` as myelinated. Warns (does not
+        block) if that vertex isn't classified as axon -- compartment labels can be imperfect.
+        """
+        vertex = int(self.tree.nearest_vertex(xyz_nm))
+        warning = None
+        if self.tree.compartment is not None:
+            code = int(self.tree.compartment[vertex])
+            comp = _COMPARTMENT.get(code, "unknown")
+            if comp != "axon":
+                warning = f"nearest skeleton vertex is classified '{comp}', not axon"
+        snapped_xyz = self.tree.vertices[vertex].tolist()
+        tag = self.myelin_wal.tag_myelinated(
+            snapped_xyz, self.root_id, self.mat_version, self.seed, path_id,
+        )
+        return {"uuid": tag.uuid, "xyz_nm": snapped_xyz, "warning": warning}
+
+    def delete_myelin_tag(self, uuid: str) -> dict:
+        """Remove a myelin tag, reverting that node to the unmyelinated default."""
+        self.myelin_wal.delete_myelin_tag(uuid)
+        return {"uuid": uuid}
+
+    def myelin_tags(self, path_id: int | None = None) -> dict:
+        """Live myelin tags, optionally restricted to one branch (for refreshing just that
+        branch's overlay when it loads)."""
+        state = WAL.load(self.myelin_wal.path)
+        tags = [
+            {"uuid": t.uuid, "xyz_nm": [float(c) for c in t.xyz], "path_id": t.path_id}
+            for t in state.myelin_tags.values()
+            if path_id is None or t.path_id == int(path_id)
+        ]
+        return {"tags": tags}
 
     # datastack with the editable production segmentation (minnie3_v1); used for Spelunker links
     # regardless of the session datastack so links always open the live proofreading table
@@ -472,6 +657,27 @@ class CellReviewService:
             "next_path_id": next_pid,
             "summary": self.coverage.summary(self.tree),
             "branches": [self.branch_metadata(i) for i in self._branch_order()],
+        }
+
+    def myelin_mark_done(self, path_id: int) -> dict:
+        """Mark a branch reviewed FOR MYELINATION (a separate coverage dimension from
+        :meth:`mark_done` -- see wal.py's ``myelin_visit`` docstring), and advance to the next
+        to-review AXON branch specifically (the myelin tool only ever offers axon branches).
+        """
+        pid = int(path_id)
+        bp = self.tree.branch_paths[pid]
+        l2 = self.tree.l2_ids_for_vertices(bp.vertices)
+        self.myelin_wal.mark_myelin_visited(l2)
+        self.myelin_coverage.mark_visited(l2)
+        todo = set(self.myelin_coverage.to_review(self.tree))
+        axon_metas = [self.branch_metadata(i) for i in self._branch_order()]
+        axon_metas = [m for m in axon_metas if m["compartment"] == "axon"]
+        next_pid = next((m["path_id"] for m in axon_metas if m["path_id"] in todo), None)
+        return {
+            "path_id": pid,
+            "next_path_id": next_pid,
+            "myelin_summary": self._tally_myelin_state(axon_metas),
+            "branches": axon_metas,
         }
 
     def omit_branch(self, path_id: int) -> dict:
@@ -599,5 +805,9 @@ class CellReviewService:
             pass
         try:
             self.wal.close()
+        except Exception:
+            pass
+        try:
+            self.myelin_wal.close()
         except Exception:
             pass

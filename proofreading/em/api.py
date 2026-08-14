@@ -6,8 +6,24 @@ frontend reaches the JSON API, the chunks, and (later) the SPA all at ``http://l
 
 Endpoints (M1):
     POST /api/cells                                   -- open or resume a cell -> header
+                                                          (warm_compartment=axon also kicks off a
+                                                          whole-cell background tube warm-up)
     GET  /api/cells/{root_id}/branches                -- branch checklist + summary
+                                                          (?compartment=axon restricts to that type)
     GET  /api/cells/{root_id}/branches/{pid}/camera   -- build tube + camera path payload
+                                                          (includes nodes_nm, the TRUE sparse
+                                                          skeleton vertices for the node overlay;
+                                                          ?compartment=axon also scopes background
+                                                          pre-build to the myelin tool's own
+                                                          axon-only, myelin-coverage sequence)
+    POST /api/cells/{root_id}/myelin/tag              -- tag the nearest skeleton node myelinated
+    DELETE /api/cells/{root_id}/myelin/tag/{uuid}     -- remove a myelin tag
+    GET  /api/cells/{root_id}/myelin/tags             -- live myelin tags (?path_id= restricts
+                                                          to one branch)
+    POST /api/cells/{root_id}/branches/{pid}/myelin-done -- mark a branch myelin-reviewed
+                                                          (separate coverage dim from /done)
+    GET  /api/cells/{root_id}/warm-status             -- live chunk-level caching progress
+                                                          (+ stalled_s to spot a wedged read)
     GET  /healthz
     /tube/<datastack>/<root_id>/{em,tgt}/...          -- precomputed chunks (CORS, no-store)
 
@@ -38,6 +54,14 @@ class OpenCellRequest(BaseModel):
     tube_mip: int = 1
     tube_radius_nm: float = 1000.0
     orient_to_path: bool = False
+    # resolution of the red target-mask overlay. None -> CellTube.DEFAULT_TGT_MIP (env
+    # PROOFREAD_TGT_MIP, default 4 = coarse but ~15x less data than the EM mip). Raise toward
+    # tube_mip for a sharper mask at a large caching cost -- see CellTube's class comment.
+    tgt_mip: Optional[int] = None
+    # when set (e.g. "axon"), background-build EVERY remaining to-review branch of that
+    # compartment right after opening, instead of only the reactive next-2 lookahead. Opt-in per
+    # request so the myelin tool can warm a whole cell without changing main.ts's behaviour.
+    warm_compartment: Optional[str] = None
 
 
 class AnnotateRequest(BaseModel):
@@ -47,6 +71,11 @@ class AnnotateRequest(BaseModel):
 
 class SetRootRequest(BaseModel):
     xyz_nm: tuple[float, float, float]  # clicked marker position in nm
+
+
+class MyelinTagRequest(BaseModel):
+    xyz_nm: tuple[float, float, float]
+    path_id: Optional[int] = None
 
 
 def create_app(wal_dir: str, default_datastack: str = "minnie65_public") -> FastAPI:
@@ -104,20 +133,27 @@ def create_app(wal_dir: str, default_datastack: str = "minnie65_public") -> Fast
                     client, rid, wal_dir,
                     step_nm=req.step_nm, tube_mip=req.tube_mip,
                     tube_radius_nm=req.tube_radius_nm, orient_to_path=req.orient_to_path,
+                    tgt_mip=req.tgt_mip,
                 )
                 sessions[rid] = s
-        return s.header()
+        header = s.header()
+        if req.warm_compartment:
+            header["warming"] = s.warm_cell(compartment=req.warm_compartment)
+        return header
 
     @app.get("/api/cells/{root_id}/branches")
-    def list_branches(root_id: int):
-        return get_session(root_id).branches()
+    def list_branches(root_id: int, compartment: Optional[str] = None):
+        return get_session(root_id).branches(compartment=compartment)
 
     @app.get("/api/cells/{root_id}/branches/{path_id}/camera")
-    def branch_camera(root_id: int, path_id: int, request: Request, orient: bool = False):
+    def branch_camera(
+        root_id: int, path_id: int, request: Request,
+        orient: bool = False, compartment: Optional[str] = None,
+    ):
         s = get_session(root_id)
         if path_id < 0 or path_id >= len(s.tree.branch_paths):
             raise HTTPException(404, f"path {path_id} out of range (0..{len(s.tree.branch_paths) - 1})")
-        payload = s.camera_path(path_id, orient=orient)
+        payload = s.camera_path(path_id, orient=orient, compartment=compartment)
         base = str(request.base_url).rstrip("/")  # e.g. http://localhost:8000
         payload["em_source"] = f"precomputed://{base}/{payload.pop('em_rel')}"
         payload["tgt_source"] = f"precomputed://{base}/{payload.pop('tgt_rel')}"
@@ -160,6 +196,17 @@ def create_app(wal_dir: str, default_datastack: str = "minnie65_public") -> Fast
             raise HTTPException(404, f"path {path_id} out of range (0..{len(s.tree.branch_paths) - 1})")
         return s.omit_branch(path_id)
 
+    @app.post("/api/cells/{root_id}/branches/{path_id}/myelin-done")
+    def mark_branch_myelin_done(root_id: int, path_id: int):
+        s = get_session(root_id)
+        if path_id < 0 or path_id >= len(s.tree.branch_paths):
+            raise HTTPException(404, f"path {path_id} out of range (0..{len(s.tree.branch_paths) - 1})")
+        return s.myelin_mark_done(path_id)
+
+    @app.get("/api/cells/{root_id}/warm-status")
+    def warm_status(root_id: int):
+        return get_session(root_id).warm_status()
+
     @app.get("/api/cells/{root_id}/live-sources")
     def live_sources(root_id: int):
         return get_session(root_id).live_sources()
@@ -175,6 +222,18 @@ def create_app(wal_dir: str, default_datastack: str = "minnie65_public") -> Fast
     @app.post("/api/cells/{root_id}/resolve")
     def resolve_supervoxels(root_id: int):
         return get_session(root_id).resolve()
+
+    @app.post("/api/cells/{root_id}/myelin/tag")
+    def tag_myelinated_node(root_id: int, req: MyelinTagRequest):
+        return get_session(root_id).tag_myelinated_node(list(req.xyz_nm), req.path_id)
+
+    @app.delete("/api/cells/{root_id}/myelin/tag/{uuid}")
+    def delete_myelin_tag(root_id: int, uuid: str):
+        return get_session(root_id).delete_myelin_tag(uuid)
+
+    @app.get("/api/cells/{root_id}/myelin/tags")
+    def myelin_tags(root_id: int, path_id: Optional[int] = None):
+        return get_session(root_id).myelin_tags(path_id)
 
     @app.on_event("shutdown")
     def _close_sessions():

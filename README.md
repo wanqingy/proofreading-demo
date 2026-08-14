@@ -78,3 +78,73 @@ See [`demo_proofreading.ipynb`](demo_proofreading.ipynb) for the full walkthroug
 including showing nearby skeletons around the current position.
 
 When finished: `fly.stop()` then `neuroglancer.stop()`.
+
+## Proofreading recorder (browser tool)
+
+A lightweight browser tool for recording manual proofreading decisions: which segments
+belong to one neurite, notes on individual segments, and the exact view — with one
+"Record" button instead of hand-copying IDs and links. Backend: [`proofreading/annotate/`](proofreading/annotate/)
+(an append-only JSONL log, replayed to reconstruct state — see [`log.py`](proofreading/annotate/log.py)).
+Frontend: [`web/annotate.html`](web/annotate.html) + [`web/src/annotate.ts`](web/src/annotate.ts).
+
+Run it:
+
+```bash
+# 1. backend -- leave running (defaults to proofread_sessions/annotate_records.jsonl)
+uv run --extra serve python -m proofreading.annotate.serve
+#    -> http://127.0.0.1:8001
+
+# 2. frontend dev server
+cd web && npm install   # first time only
+npm run dev             # -> http://localhost:5173 (strictPort: true -- the OAuth client's
+                         #    redirect URI is registered for this exact port, so it must land
+                         #    here; kill anything else already bound to 5173 if it doesn't)
+```
+
+Open <http://localhost:5173/annotate.html>. Select all segments belonging to one neurite in
+the embedded viewer, optionally leave a note by adding an annotation point linked to a
+segment, type your name once (remembered per browser), and hit **Record**. The dropdown at
+the bottom lists everything recorded so far — **open** (view read-only, new tab), **edit**
+(reopen in this tab to update it in place), **del** (delete). Recording a segment already
+owned by a different neurite prompts for confirmation (shared segment vs. mistake) instead
+of silently overwriting.
+
+**If the data source needs Google auth your own OAuth client can't get** (e.g. a Brainmaps
+volume gated to a specific allowlist of client apps): use
+[`web/public/ng-recorder.js`](web/public/ng-recorder.js) instead. It injects the same
+Record/dropdown control bar into a page you don't control but are already signed into
+(e.g. `neuroglancer-demo.appspot.com`) — paste its contents into the DevTools console (or
+save as a DevTools Snippet: Sources tab → Snippets → run with Ctrl+Enter) on that page. It
+duck-types segmentation/annotation layers instead of relying on fixed names, since layer
+names on someone else's page aren't ours to control.
+
+Both write to the same backend, so a shared team log works regardless of which entry point
+people use. The `user` field on each entry is self-reported (not cryptographically verified)
+for now.
+
+## Reclaiming disk (tube cache)
+
+Flying a cell downloads its EM/mask chunks into `proofread_sessions/tube_cache/<datastack>/<root_id>/`.
+This grows fast — tens of GB per heavily-reviewed cell. It's all **derived** data, so deleting it
+only costs re-download time; the `*.jsonl` WAL logs alongside it (every annotation you've made)
+are never touched by this tool.
+
+```bash
+# what's on disk, and which mask volumes are stale
+uv run python -m proofreading.em.clear_cache
+
+# drop mask volumes that aren't at the mask mip in effect (keeps all EM -> nothing refetches)
+uv run python -m proofreading.em.clear_cache --stale-masks -f
+
+# one cell, or everything
+uv run python -m proofreading.em.clear_cache --cell 864691135572530981 -f
+uv run python -m proofreading.em.clear_cache --all -f
+```
+
+Every mode is a **dry run until you pass `-f`**. Deletion is hard-gated to paths strictly inside
+`tube_cache`, and refuses outright if a `.jsonl` is found anywhere in the target.
+
+There is deliberately **no "clear cache" button in the review UIs**: myelin coverage and
+error-review coverage are separate dimensions (see `CONTEXT.md`), so a cell that looks "fully
+reviewed" to one tool may be untouched by the other — clearing on that signal would force a long
+re-cache the moment you start the second pass.
