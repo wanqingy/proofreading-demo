@@ -417,6 +417,37 @@ class CellReviewService:
             "chunks_cached": self._chunks_cached,  # monotonic; the reliable "still alive" signal
         }
 
+    def warm_targets(self, compartment: str | None = None) -> dict:
+        """Branches that still need a tube build, in review order (proximal->distal).
+
+        Split out of :meth:`warm_cell` so an external driver -- the multi-cell warm queue in
+        :mod:`proofreading.em.warm_queue` -- can walk the same list ONE branch at a time via
+        :meth:`warm_branch` instead of dumping it all on this session's background executor.
+        That is what makes a queued cell interruptible between branches, and what lets the
+        queue know how much work a cell actually represents before it starts.
+        """
+        all_metas = {pid: self.branch_metadata(pid) for pid in self._branch_order()}
+        order = [
+            pid for pid in self._branch_order()
+            if compartment is None or all_metas[pid]["compartment"] == compartment
+        ]
+        state_key = "myelin_state" if compartment == "axon" else "state"
+        pending: list[int] = []
+        already_built = 0
+        for pid in order:
+            if self._branch_done(pid):
+                already_built += 1
+                continue
+            if all_metas[pid][state_key] != "to_review":
+                continue
+            pending.append(int(pid))
+        return {"pending": pending, "already_built": already_built, "total": len(order)}
+
+    def branch_built(self, path_id: int) -> bool:
+        """True once this branch's tube is cached at the mips in effect (public: the warm queue
+        checks it to tell a real build from one that hit :meth:`fill_branch`'s time budget)."""
+        return self._branch_done(int(path_id))
+
     def warm_cell(self, compartment: str | None = None) -> dict:
         """Queue background tube builds for EVERY remaining to-review branch, not just the next
         ``prebuild_ahead``.
@@ -427,20 +458,9 @@ class CellReviewService:
         these serial so a long warm-up can't starve the on-demand fetch the user is waiting on;
         the point is that it runs AHEAD of time, not that it runs wider.
         """
-        all_metas = {pid: self.branch_metadata(pid) for pid in self._branch_order()}
-        order = [
-            pid for pid in self._branch_order()
-            if compartment is None or all_metas[pid]["compartment"] == compartment
-        ]
-        state_key = "myelin_state" if compartment == "axon" else "state"
+        t = self.warm_targets(compartment)
         queued: list[int] = []
-        already_built = 0
-        for pid in order:
-            if self._branch_done(pid):
-                already_built += 1
-                continue
-            if all_metas[pid][state_key] != "to_review":
-                continue
+        for pid in t["pending"]:
             with self._prebuild_lock:
                 if pid in self._prebuilding:
                     continue
@@ -448,7 +468,23 @@ class CellReviewService:
             self._prebuild_ex.submit(self._prebuild, pid, self._epoch)
             queued.append(int(pid))
         return {"queued": queued, "n_queued": len(queued),
-                "already_built": already_built, "total": len(order)}
+                "already_built": t["already_built"], "total": t["total"]}
+
+    def warm_branch(self, path_id: int) -> bool:
+        """Build ONE branch's tube synchronously, in the CALLER's thread.
+
+        For the multi-cell warm queue, which serializes the work itself and therefore must not
+        hand it to this session's executor. Returns False if this session's own pre-builder
+        already has the branch in flight -- the queue skips it rather than blocking, since
+        ``_prebuild``'s per-branch lock means waiting would only buy a duplicate early-out.
+        """
+        pid = int(path_id)
+        with self._prebuild_lock:
+            if pid in self._prebuilding:
+                return False
+            self._prebuilding.add(pid)  # _prebuild's `finally` discards it
+        self._prebuild(pid, self._epoch)
+        return True
 
     def _prebuild(self, path_id: int, epoch: int) -> None:
         """Background worker: build one branch's tube unless a re-root (epoch bump) invalidated it.

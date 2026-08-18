@@ -24,6 +24,11 @@ Endpoints (M1):
                                                           (separate coverage dim from /done)
     GET  /api/cells/{root_id}/warm-status             -- live chunk-level caching progress
                                                           (+ stalled_s to spot a wedged read)
+    POST   /api/warm-queue                            -- queue N cells to cache in the
+                                                          background, ONE AT A TIME
+    GET    /api/warm-queue                            -- queue status (+ live fill of the cell
+                                                          being built now)
+    DELETE /api/warm-queue/{root_id}                  -- drop a cell from the queue
     GET  /healthz
     /tube/<datastack>/<root_id>/{em,tgt}/...          -- precomputed chunks (CORS, no-store)
 
@@ -43,6 +48,7 @@ from pydantic import BaseModel
 
 from .client import EMClient
 from .service import CellReviewService
+from .warm_queue import WarmQueue
 
 
 class OpenCellRequest(BaseModel):
@@ -76,6 +82,14 @@ class SetRootRequest(BaseModel):
 class MyelinTagRequest(BaseModel):
     xyz_nm: tuple[float, float, float]
     path_id: Optional[int] = None
+
+
+class WarmQueueRequest(BaseModel):
+    root_ids: list[int]  # warmed one cell at a time, in this order
+    datastack: Optional[str] = None
+    version: Optional[int] = None
+    compartment: Optional[str] = "axon"  # matches the myelin tool's axon-only sweep
+    tgt_mip: Optional[int] = None
 
 
 def create_app(wal_dir: str, default_datastack: str = "minnie65_public") -> FastAPI:
@@ -116,6 +130,21 @@ def create_app(wal_dir: str, default_datastack: str = "minnie65_public") -> Fast
             raise HTTPException(404, f"cell {root_id} not open; POST /api/cells first")
         return s
 
+    def open_session(root_id: int, datastack: str, version: Optional[int] = None,
+                     **kw) -> CellReviewService:
+        """Get-or-create a cell session. Shared by /api/cells and the warm queue, so a cell the
+        queue has already opened is the SAME session the browser then gets -- one skeleton
+        fetch, and one set of per-branch build locks covering both."""
+        rid = int(root_id)
+        with sessions_lock:
+            s = sessions.get(rid)
+            if s is None or s.datastack != datastack:
+                s = CellReviewService(get_client(datastack, version), rid, wal_dir, **kw)
+                sessions[rid] = s
+            return s
+
+    warm_queue = WarmQueue(open_session)
+
     # ----- endpoints (sync def -> blocking CAVE/CloudVolume runs in the threadpool) --- #
     @app.get("/healthz")
     def healthz():
@@ -124,18 +153,12 @@ def create_app(wal_dir: str, default_datastack: str = "minnie65_public") -> Fast
     @app.post("/api/cells")
     def open_cell(req: OpenCellRequest):
         ds = req.datastack or default_datastack
-        rid = int(req.root_id)
-        with sessions_lock:
-            s = sessions.get(rid)
-            if s is None or s.datastack != ds:
-                client = get_client(ds, req.version)
-                s = CellReviewService(
-                    client, rid, wal_dir,
-                    step_nm=req.step_nm, tube_mip=req.tube_mip,
-                    tube_radius_nm=req.tube_radius_nm, orient_to_path=req.orient_to_path,
-                    tgt_mip=req.tgt_mip,
-                )
-                sessions[rid] = s
+        s = open_session(
+            req.root_id, ds, req.version,
+            step_nm=req.step_nm, tube_mip=req.tube_mip,
+            tube_radius_nm=req.tube_radius_nm, orient_to_path=req.orient_to_path,
+            tgt_mip=req.tgt_mip,
+        )
         header = s.header()
         if req.warm_compartment:
             header["warming"] = s.warm_cell(compartment=req.warm_compartment)
@@ -207,6 +230,21 @@ def create_app(wal_dir: str, default_datastack: str = "minnie65_public") -> Fast
     def warm_status(root_id: int):
         return get_session(root_id).warm_status()
 
+    @app.post("/api/warm-queue")
+    def warm_queue_submit(req: WarmQueueRequest):
+        ds = req.datastack or default_datastack
+        open_kw = {"version": req.version, "tgt_mip": req.tgt_mip}
+        submitted = [warm_queue.submit(r, ds, req.compartment, open_kw) for r in req.root_ids]
+        return {"submitted": submitted, **warm_queue.status()}
+
+    @app.get("/api/warm-queue")
+    def warm_queue_status():
+        return warm_queue.status()
+
+    @app.delete("/api/warm-queue/{root_id}")
+    def warm_queue_cancel(root_id: int):
+        return warm_queue.cancel(root_id)
+
     @app.get("/api/cells/{root_id}/live-sources")
     def live_sources(root_id: int):
         return get_session(root_id).live_sources()
@@ -237,6 +275,7 @@ def create_app(wal_dir: str, default_datastack: str = "minnie65_public") -> Fast
 
     @app.on_event("shutdown")
     def _close_sessions():
+        warm_queue.shutdown()
         for s in sessions.values():
             s.close()
 

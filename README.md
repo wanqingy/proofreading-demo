@@ -122,6 +122,45 @@ Both write to the same backend, so a shared team log works regardless of which e
 people use. The `user` field on each entry is self-reported (not cryptographically verified)
 for now.
 
+## Pre-caching cells (warm queue)
+
+Caching a whole cell takes ~30 min, so queue the cells you plan to review and let them build
+while you do something else. Cells are cached **one at a time, in the order you list them** —
+so the first cell is reviewable long before the last one starts.
+
+```bash
+# backend must be running (it does the fetching; see below)
+uv run python -m proofreading.em.warm_cells 864691136335553971 864691135572530981
+
+uv run python -m proofreading.em.warm_cells --status            # what's in the queue
+uv run python -m proofreading.em.warm_cells --cancel 864691135572530981
+uv run python -m proofreading.em.warm_cells --no-watch 8646911…  # queue and walk away
+```
+
+```
+  864691136335553971  warming    [#################---] 49/57 branches  branch 8 tgt 0/2
+  864691135572530981  queued     waiting its turn
+```
+
+Ctrl-C only stops *watching*; `--cancel` stops a cell, after the branch already in flight (a
+fill isn't interruptible, and abandoning one mid-way would leave chunks on disk with no marker
+vouching for them). Cancelled or interrupted cells **resume** — re-queue and everything already
+cached is skipped, which is also why nothing about the queue is persisted across restarts: the
+tube cache is the real record of progress.
+
+Two things worth knowing:
+
+- **Serial is faster than parallel here.** One branch fill already saturates the tuned
+  connection pool, so warming two cells at once splits the same bandwidth and pushes *both*
+  finish times out.
+- **The queue runs inside the backend**, and the CLI just drives it over HTTP. A standalone
+  warming process wouldn't share the server's per-branch build locks, so it would re-download
+  branches the server was already building for you.
+
+Warming is also automatic for the cell you're actively reviewing: `myelin.html` sends
+`warm_compartment: "axon"` on open, which queues every remaining axon branch of *that* cell.
+The queue above is for the cells you *haven't* opened yet.
+
 ## Reclaiming disk (tube cache)
 
 Flying a cell downloads its EM/mask chunks into `proofread_sessions/tube_cache/<datastack>/<root_id>/`.
