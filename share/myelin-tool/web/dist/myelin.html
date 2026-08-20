@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Axon myelination fly-through</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: #000;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+      /* neuroglancer attaches here (makeMinimalViewer's default target id) */
+      #neuroglancer-container {
+        position: absolute;
+        inset: 0;
+      }
+      #hud {
+        position: absolute;
+        bottom: 10px;
+        right: 10px;
+        z-index: 10000;
+        background: rgba(0, 0, 0, 0.72);
+        color: #d7e3ff;
+        padding: 10px 12px;
+        border: 1px solid #2c3a5a;
+        border-radius: 8px;
+        font-size: 12px;
+        line-height: 1.5;
+        min-width: 240px;
+        user-select: none;
+      }
+      #hud h1 {
+        font-size: 12px;
+        margin: 0 0 6px;
+        color: #7fa8ff;
+        letter-spacing: 0.04em;
+      }
+      #hud .row {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+      }
+      #hud .v {
+        color: #fff;
+        font-variant-numeric: tabular-nums;
+      }
+      #hud .warn {
+        color: #ff8a8a;
+      }
+      #hud .ok {
+        color: #8aff9c;
+      }
+      #hud .controls {
+        margin-top: 8px;
+        border-top: 1px solid #2c3a5a;
+        padding-top: 8px;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        align-items: center;
+      }
+      #hud button {
+        background: #1c2740;
+        color: #d7e3ff;
+        border: 1px solid #3a4d78;
+        border-radius: 5px;
+        padding: 3px 9px;
+        cursor: pointer;
+        font: inherit;
+      }
+      #hud button:hover {
+        background: #28365a;
+      }
+      #hud label {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+      }
+      #hud input[type="range"] {
+        width: 90px;
+      }
+      #status {
+        margin-top: 6px;
+        color: #9fb0d0;
+        font-size: 11px;
+      }
+    </style>
+    <script type="module" crossorigin src="/assets/myelin-BY9-yLOf.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/myelin-C9CTwhEK.css">
+  </head>
+  <body>
+    <div id="neuroglancer-container"></div>
+    <div id="hud">
+      <h1>AXON MYELINATION</h1>
+      <div class="row" style="margin-bottom: 6px; gap: 4px">
+        <input
+          id="cellid"
+          placeholder="root id"
+          style="flex: 1; min-width: 0; background: #1c2740; color: #d7e3ff; border: 1px solid #3a4d78; border-radius: 5px; padding: 3px; font: inherit"
+        />
+        <button id="loadcell">load</button>
+      </div>
+      <div class="row" style="margin-bottom: 6px">
+        <select
+          id="branch"
+          style="width: 100%; background: #1c2740; color: #d7e3ff; border: 1px solid #3a4d78; border-radius: 5px; padding: 3px; font: inherit"
+        ></select>
+      </div>
+      <div class="row" style="margin-bottom: 6px; color: #9fb0d0; font-size: 11px">
+        <span id="coverage">&mdash;</span>
+      </div>
+      <div class="row"><span>progress</span><span class="v" id="progresspct">0%</span></div>
+      <div class="row" style="margin-bottom: 4px">
+        <input type="range" id="progress" min="0" max="1000" value="0" style="width: 100%" />
+      </div>
+      <div class="row" style="margin-bottom: 4px; min-height: 14px">
+        <span id="paintstate" style="font-weight: bold"></span>
+      </div>
+      <!-- live tube-caching progress: a moving bar means the fetch is alive; it turns red and
+           says STALLED when no chunk has landed for a while (wedged GCS read). -->
+      <div style="margin-bottom: 6px">
+        <div
+          id="warmbar"
+          style="display: none; height: 4px; background: #1c2740; border-radius: 2px; overflow: hidden"
+        >
+          <div id="warmfill" style="height: 100%; width: 0%; background: #7fa8ff; transition: width 0.3s"></div>
+        </div>
+        <div id="warmlabel" style="color: #7f8db0; font-size: 10px; margin-top: 2px"></div>
+      </div>
+      <div class="controls">
+        <button id="toggle">pause cam</button>
+        <button id="markdone">branch done (x)</button>
+        <label>speed <input type="range" id="speed" min="200" max="6000" step="100" value="1000" /></label>
+      </div>
+      <div id="legend" style="margin-top: 6px; color: #7f8db0; font-size: 11px">
+        <b style="color: #d7e3ff">space</b> play/pause &middot;
+        <b style="color: #d7e3ff">x</b> mark branch myelin-reviewed + advance<br />
+        at cursor: <b style="color: #33ff99">t</b> tag node myelinated (default unmyelinated) &middot;
+        <b style="color: #ff5566">d</b> delete nearest tag<br />
+        <b style="color: #ff8a8a">p</b> start/stop painting -- auto-tags every node the camera
+        passes while flying, so you don't need <b>t</b> per node<br />
+        <b style="color: #33ff99">green</b> dots: myelinated tags (also browsable/deletable in
+        neuroglancer's own Annotations panel)<br />
+        whole cell: <b style="color: #cc66ff">magenta</b> branch points &middot;
+        <b style="color: #ffffff">white</b> tips &middot; 3D panel shows the full arbor
+      </div>
+      <div id="status">connecting...</div>
+    </div>
+    <!-- surface ANY runtime error (incl. module-eval errors that fire before myelin.ts runs)
+         onto the panel, so we don't need DevTools to diagnose it. -->
+    <script>
+      function __myelinErr(msg) {
+        var s = document.getElementById("status");
+        if (s) {
+          s.textContent = "ERR: " + msg;
+          s.className = "warn";
+        }
+      }
+      window.addEventListener("error", function (e) {
+        __myelinErr(
+          (e.message || e.error) +
+            (e.filename ? " @ " + String(e.filename).split("/").pop() + ":" + e.lineno : ""),
+        );
+        console.error("[myelin] error", e.error || e.message);
+      });
+      window.addEventListener("unhandledrejection", function (e) {
+        var r = e.reason;
+        __myelinErr("promise: " + (r && (r.stack || r.message || r)));
+        console.error("[myelin] unhandledrejection", r);
+      });
+    </script>
+  </body>
+</html>

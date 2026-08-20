@@ -1,0 +1,6 @@
+node_modules/
+*.log
+
+# NOTE: unlike the parent repo's web/.gitignore, `dist/` is NOT listed here -- the whole point
+# of this package is a prebuilt UI committed at share/myelin-tool/web/dist so recipients need no
+# Node toolchain (see README.md). Rebuild it with `npm run build` before committing a change.

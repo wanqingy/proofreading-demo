@@ -1,0 +1,21 @@
+[project]
+name = "myelin-tool"
+version = "0.1.0"
+description = "Standalone axon myelination tagging tool (trimmed from proofreading-demo)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.4.4",
+    "caveclient>=8.1.0",
+    "cloud-volume>=12.13.1",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    # transitive (google-auth -> caveclient/cloud-volume), pinned directly: cryptography 50.x's
+    # compiled _rust extension fails to dlopen on at least one verified machine (arm64 macOS) --
+    # "symbol not found in flat namespace '_ASN1_GENERALIZEDTIME_free'", an OpenSSL ABI mismatch
+    # in that wheel, not anything specific to this tool. 48.0.0 is what the parent repo's own
+    # uv.lock happens to pin and is confirmed working; commit this package's own uv.lock (`uv
+    # lock`) so a recipient's `uv sync` reproduces that resolution instead of free-resolving to
+    # whatever is newest the day they install.
+    "cryptography<49",
+]
