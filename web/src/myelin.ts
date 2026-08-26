@@ -384,9 +384,28 @@ async function deleteNearestTag() {
   }
 }
 
+// Buffer depth: how much loaded EM sits ahead of the camera, and whether that's currently holding
+// the fly-through back. Worth showing rather than hiding -- if the camera is crawling you want to
+// know it's waiting on chunks (and not, say, that the speed slider moved).
+function renderBufferDepth(phase: "buffer" | "play") {
+  const d = kernel.getBufferDepth();
+  const el = $("bufdepth");
+  if (phase !== "play" || d.targetNm <= 0) {
+    el.textContent = "";
+    return;
+  }
+  const pct = Math.round((d.aheadNm / d.targetNm) * 100);
+  const slowed = d.speedFraction < 0.95;
+  el.textContent = slowed
+    ? `buffer ${pct}% -- slowed to ${Math.round(d.speedFraction * 100)}%${d.precise ? "" : " (approx)"}`
+    : `buffer ${pct}%`;
+  el.className = slowed ? "warn" : "";
+}
+
 function onProgress(frac: number, phase: "buffer" | "play") {
   $("progresspct").textContent = phase === "buffer" ? "buffering" : `${(frac * 100).toFixed(0)}%`;
   ($("progress") as HTMLInputElement).value = String(Math.round(frac * 1000));
+  renderBufferDepth(phase);
   if (paintMode && phase === "play") {
     const pos = kernel.getCurrentPositionNm();
     const pid = kernel.getCurrentPid();
@@ -433,6 +452,13 @@ const kernel = createFlyKernel({
     drawSkeletonFeatures(); // whole-cell branch/end markers (once; positions are root-invariant)
   },
 });
+
+// `flyCache()` in the devtools console: dumps cache pressure + resident/expired chunk counts, to
+// tell a look-ahead problem from an eviction problem when a branch keeps slowing down.
+// `__fly` exposes the kernel for ad-hoc inspection (`__fly.getBufferDepth()`) the same way
+// flykernel already publishes `window.viewer`.
+(window as any).flyCache = () => kernel.logCacheDiagnostic();
+(window as any).__fly = kernel;
 
 async function loadBranchAndRefresh(pid: number) {
   setPaintMode(false); // leaving this branch -- don't carry painting into the next one

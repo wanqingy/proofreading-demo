@@ -11,6 +11,12 @@
 import "neuroglancer/unstable/ui/default_viewer.css";
 import "neuroglancer/unstable/main_module.js";
 import { setupDefaultViewer } from "neuroglancer/unstable/ui/default_viewer_setup.js";
+import {
+  ChunkMemoryStatistics,
+  ChunkState,
+  getChunkStateStatisticIndex,
+  numChunkMemoryStatistics,
+} from "neuroglancer/unstable/chunk_manager/base.js";
 
 // Red overlay for the target-mask layer -- mirrors proofreading/em/tube.py `_TINT`.
 const TINT = `void main() {
@@ -53,6 +59,25 @@ export interface FlyKernelOptions {
   onBuildViewerState?: (state: any) => any;
 }
 
+// How much loaded path we want in front of the camera, expressed as seconds of travel at the
+// current speed. Neuroglancer's own prefetch predicts PREFETCH_MS=2000ms ahead
+// (sliceview/backend.js), so asking for ~2s keeps the two mechanisms aimed at the same window.
+const LOOKAHEAD_SECONDS = 2;
+// Never stop completely: a frozen camera can't trigger the velocity estimator that drives
+// prefetch, so it would have to wait for plain visible-tier loading to dig it out.
+const MIN_SPEED_FRACTION = 0.08;
+
+export interface BufferDepth {
+  // arc nm of contiguously-loaded path ahead of the camera (capped at the target window)
+  aheadNm: number;
+  // the window we're trying to keep loaded (arc nm); aheadNm/targetNm drives the speed
+  targetNm: number;
+  // speed multiplier actually applied this frame, 1 = unimpeded
+  speedFraction: number;
+  // false once the precise per-chunk probe is unavailable and we're on the ratio fallback
+  precise: boolean;
+}
+
 export interface FlyKernel {
   getViewer(): any;
   getResNm(): [number, number, number];
@@ -65,9 +90,14 @@ export interface FlyKernel {
   setScrubbing(v: boolean): void;
   getCurrentPositionNm(): [number, number, number] | null;
   loadBranch(pid: number): Promise<Camera>;
+  getBufferDepth(): BufferDepth;
+  // one-shot console dump: per-source chunk counts + cache pressure, to tell "chunks were never
+  // requested" apart from "chunks were loaded and then evicted"
+  logCacheDiagnostic(): Promise<void>;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 
 export function createFlyKernel(opts: FlyKernelOptions): FlyKernel {
   const status = (msg: string, cls = "") => opts.onStatus?.(msg, cls);
@@ -115,13 +145,178 @@ export function createFlyKernel(opts: FlyKernelOptions): FlyKernel {
     return [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f];
   };
 
+  // ---- buffer depth: how much loaded path is in front of the camera --------------------- //
+  //
+  // Measured by asking the `em` layer's chunk cache directly whether the chunk containing each
+  // upcoming path position is resident in GPU memory. Keys are `curPositionInChunks.join()` and
+  // residency is `state === ChunkState.GPU_MEMORY` -- the same lookup neuroglancer's own
+  // SliceView.isReady does (sliceview/frontend.js). We deliberately do NOT call
+  // viewer.isReady(): it flushes ALL pending chunk updates past the 30ms frame deadline
+  // (chunk_manager/frontend.js), and it also aggregates the 3D panel's live graphene skeleton
+  // layer, which would let a slow network source throttle a fly-through over local chunks.
+  //
+  // The containing chunk is a PROXY for the full visible footprint (the 2D window spans a couple
+  // of chunks at crossSectionScale 0.2), so this can read "loaded" for a view still missing edge
+  // chunks. Good enough for a depth metric; the speed law only needs a monotone signal.
+  interface ChunkProbe {
+    chunks: Map<string, { state: number }>;
+    chunkDataSize: number[];
+    // The chunk grid is anchored at the volume's voxel_offset, NOT at global origin: neuroglancer
+    // builds a chunk's voxel bounds as `gridPosition * chunkDataSize + baseVoxelOffset`
+    // (sliceview/volume/backend.js computeChunkBounds), and the precomputed datasource keeps the
+    // spec 0-based (`upperVoxelBound: scaleInfo.size`) with the offset held separately
+    // (datasource/precomputed/frontend.js). So this has to come off the position before dividing --
+    // verified against the on-disk chunk filenames, which are exactly those offset bounds.
+    baseVoxelOffset: number[];
+    lowerChunkBound: number[];
+    upperChunkBound: number[];
+    minSpanNm: number; // smallest chunk extent in nm, sets the probe step
+  }
+  let probe: ChunkProbe | null = null;
+  let probeAttempts = 0;
+  let probeUsable = true; // false -> permanently on the ratio fallback
+  let probeVerified = false;
+  let depth: BufferDepth = { aheadNm: 0, targetNm: 0, speedFraction: 1, precise: false };
+  let speedFraction = 1; // smoothed, so motion doesn't judder as chunks land
+
+  function emUserLayer(): any {
+    const managed = viewer?.layerManager?.managedLayers ?? [];
+    return managed.find((l: any) => l.name === "em")?.layer ?? null;
+  }
+
+  function resolveProbe(): ChunkProbe | null {
+    if (probe || !probeUsable) return probe;
+    // visibleSourcesList only fills once the layer is actually being rendered, so this legitimately
+    // fails for the first frames after a branch loads. Keep retrying indefinitely (one find + a
+    // property read per call is nothing) and just say so once -- giving up permanently would
+    // downgrade the metric for the whole session because one cold branch was slow to first paint.
+    if (++probeAttempts === 300) {
+      console.warn("[flykernel] chunk probe still unresolved; on view-completeness fallback for now");
+    }
+    try {
+      const em = emUserLayer();
+      for (const rl of em?.renderLayers ?? []) {
+        // visibleSourcesList entries are {source: TransformedSource, ...}; the chunk map and spec
+        // live on that entry's `source` (verified against the live viewer -- `.source.source` is
+        // undefined here, so this is the level that owns `chunks`).
+        const src = rl.visibleSourcesList?.[0]?.source;
+        const spec = src?.spec;
+        if (!src?.chunks || !spec?.chunkDataSize) continue;
+        const cds: number[] = Array.from(spec.chunkDataSize);
+        probe = {
+          chunks: src.chunks,
+          chunkDataSize: cds,
+          baseVoxelOffset: Array.from(spec.baseVoxelOffset ?? cds.map(() => 0)),
+          lowerChunkBound: Array.from(spec.lowerChunkBound ?? cds.map(() => 0)),
+          upperChunkBound: Array.from(spec.upperChunkBound ?? cds.map(() => Infinity)),
+          minSpanNm: Math.min(...cds.map((n, i) => n * resNm[i])),
+        };
+        return probe;
+      }
+    } catch (e) {
+      console.warn("[flykernel] chunk probe resolve failed; using fallback", e);
+      probeUsable = false;
+    }
+    return null;
+  }
+
+  // chunk-grid key for a GLOBAL voxel position, matching updateFixedCurPositionInChunks' clamped
+  // floor (sliceview/base.js) once the position is put in the source's own 0-based chunk space.
+  // Assumes the em layer's voxel grid is the viewer's global grid, which holds because the viewer
+  // dimensions are constructed from this very volume's `resolution_nm` (see setupViewer).
+  function chunkKey(p: [number, number, number], pr: ChunkProbe): string {
+    const k: number[] = [];
+    for (let d = 0; d < 3; d++) {
+      const c = Math.floor((p[d] - pr.baseVoxelOffset[d]) / pr.chunkDataSize[d]);
+      k.push(clamp(c, pr.lowerChunkBound[d], pr.upperChunkBound[d] - 1));
+    }
+    return k.join();
+  }
+
+  function chunkResident(p: [number, number, number], pr: ChunkProbe): boolean {
+    const state = pr.chunks.get(chunkKey(p, pr))?.state;
+    if (state === ChunkState.GPU_MEMORY) return true;
+    // A chunk whose fetch already FAILED is never going to arrive -- the tube is sparse and a fill
+    // that hit its time budget leaves real holes (those 404s). Waiting on one would park the camera
+    // at the slowdown floor for ~13s per chunk, so treat it as "nothing to wait for" and glide on.
+    // EXPIRED is deliberately NOT included: an evicted chunk gets re-requested once visible, so
+    // holding back for it is exactly right.
+    return state === ChunkState.FAILED;
+  }
+
+  // Fallback metric: completeness of the CURRENT view only, from the counters the worker keeps
+  // updated every ~200ms (the pattern ui/layer_bar.js uses). Reactive rather than predictive --
+  // it can only notice we're already in an incomplete view, not that one is coming.
+  //
+  // Returns null for "no information": a layer that isn't rendering yet reports needed === 0,
+  // which is NOT the same as "everything is loaded". Conflating the two is actively harmful --
+  // it let the priming dwell return instantly and made the probe self-check run against an empty
+  // chunk map, falsely concluding the key math was broken. Callers decide what no-information
+  // means for them (keep waiting vs. don't stall the camera).
+  function viewCompleteness(): number | null {
+    try {
+      let needed = 0;
+      let available = 0;
+      for (const rl of emUserLayer()?.renderLayers ?? []) {
+        const info = rl.layerChunkProgressInfo;
+        if (!info) continue;
+        needed += info.numVisibleChunksNeeded;
+        available += info.numVisibleChunksAvailable;
+      }
+      return needed === 0 ? null : available / needed;
+    } catch {
+      return null;
+    }
+  }
+
+  // Arc nm of loaded path ahead of `fromArc`, capped at `capNm`.
+  function loadedAheadNm(fromArc: number, capNm: number): number {
+    const pr = resolveProbe();
+    if (!pr) {
+      // Fallback: scale the window by how complete the current view is. No telemetry -> assume
+      // clear, so a missing metric can never be the thing that slows the fly-through down.
+      return capNm * (viewCompleteness() ?? 1);
+    }
+    const step = Math.max(1, pr.minSpanNm / 2); // half a chunk: can't skip a boundary
+    for (let d = 0; d <= capNm; d += step) {
+      if (!chunkResident(posAt(fromArc + d), pr)) return d;
+    }
+    return capNm;
+  }
+
+  // Re-measure buffer depth and update the smoothed speed multiplier. Cheap (a handful of Map
+  // lookups) but pointless to redo every frame at 60fps, so it runs on the same 6-frame cadence
+  // as the progress callback below.
+  function updateBufferDepth() {
+    const window = Math.max(LOOKAHEAD_SECONDS * speed, 2 * (probe?.minSpanNm ?? 1024));
+    // Near the end of a branch there is less path left than the window -- measure against what
+    // remains, or we'd read "shallow buffer" and crawl over the last stretch of every branch.
+    const remaining = Math.max(0, totalArc - s);
+    const target = Math.min(window, remaining);
+    if (target <= 0) {
+      depth = { aheadNm: 0, targetNm: 0, speedFraction: 1, precise: !!probe };
+      speedFraction = 1;
+      return;
+    }
+    const ahead = loadedAheadNm(s, target);
+    const wanted = clamp(ahead / target, MIN_SPEED_FRACTION, 1);
+    // ease toward the target so chunks landing mid-glide don't snap the speed
+    speedFraction += (wanted - speedFraction) * 0.25;
+    depth = { aheadNm: ahead, targetNm: target, speedFraction, precise: !!probe };
+  }
+
   const frame = (now: number) => {
     const dt = (now - last) / 1000;
     last = now;
     frames++;
 
     if (phase === "play" && running && dt > 0 && ptsVox.length >= 2) {
-      s += speed * dt; // forward only
+      if (frames % 6 === 0) updateBufferDepth();
+      // Advance proportionally to how much loaded path is ahead: full speed when well buffered,
+      // creeping when the loader is barely keeping up. This is what stops the camera from gliding
+      // over EM that hasn't arrived -- an unloaded stretch of axon otherwise looks exactly like
+      // an unmyelinated one.
+      s += speed * speedFraction * dt; // forward only
       if (s >= totalArc) {
         s = totalArc;
         running = false;
@@ -170,7 +365,16 @@ export function createFlyKernel(opts: FlyKernelOptions): FlyKernel {
       cq.capacities.systemMemory.sizeLimit.value = 1.5e9;
       cq.capacities.systemMemory.itemLimit.value = 1e6;
       cq.capacities.download.itemLimit.value = 16;
-      cq.enablePrefetch.value = false;
+      // Prefetch ON: neuroglancer's prefetch is VELOCITY-based -- it estimates camera velocity and
+      // requests up to PREFETCH_MS=2000ms ahead along the direction of travel
+      // (sliceview/backend.js), which is exactly the access pattern of a constant-speed
+      // fly-through. It used to be off because the old buffer-the-whole-branch pre-pass already
+      // touched every chunk, so prefetch only added contention for the 16 download slots; now that
+      // playback is gated on a rolling look-ahead window instead, prefetch is what keeps that
+      // window full. Caveat worth knowing: MAX_PREFETCH_VELOCITY=0.1 global-voxels/ms means
+      // prefetch quietly disengages per-dimension above ~1600nm/s at 16nm voxels, so at the top of
+      // the speed slider the proportional slowdown carries it alone.
+      cq.enablePrefetch.value = true;
     } catch (e) {
       console.warn("[flykernel] could not set cache limits", e);
     }
@@ -214,25 +418,80 @@ export function createFlyKernel(opts: FlyKernelOptions): FlyKernel {
     stepNm = cam.step_nm || 500;
   }
 
+  // Dwell at the current camera position until the em layer reports the view complete, or
+  // `timeoutMs` elapses. The minimum dwell exists because the completeness counters are refreshed
+  // by the worker only every ~200ms (chunk_manager/backend.js): sampled immediately after moving,
+  // they can still describe the PREVIOUS position and read as a spurious "ready".
+  async function dwellUntilLoaded(timeoutMs: number, minMs = 250): Promise<boolean> {
+    const t0 = performance.now();
+    for (;;) {
+      await sleep(50);
+      const elapsed = performance.now() - t0;
+      // Require positive evidence (needed > 0 AND all of it available). A null reading means the
+      // layer isn't rendering yet, so there is nothing to conclude -- keep waiting until the
+      // timeout rather than declaring the view loaded.
+      const c = viewCompleteness();
+      if (elapsed >= minMs && c !== null && c >= 1) return true;
+      if (elapsed >= timeoutMs) return false;
+    }
+  }
+
+  // Prime only the START of the branch, then hand off to the proportional gate in frame().
+  //
+  // This used to sweep the ENTIRE branch before playing, which on a long branch was both slow to
+  // get going and self-defeating: a branch whose chunks exceed the 1GB GPU cap evicts its own
+  // early chunks before the sweep reaches the end, so "buffering 100%" still meant an unloaded
+  // start. Priming a couple of look-ahead windows is enough to begin smoothly; the rolling
+  // look-ahead keeps it that way, and prefetch does the fetching in front of the camera.
   async function bufferAndPlay(pid: number) {
     const token = ++bufferToken;
     phase = "buffer";
     s = 0;
-    const coverStep = Math.max(1, Math.round(1200 / stepNm));
-    for (let i = 0; i < ptsVox.length; i += coverStep) {
+    speedFraction = 1; // start optimistic; the gate corrects within a few frames
+    const primeNm = Math.min(totalArc, 2 * LOOKAHEAD_SECONDS * speed);
+    const stops = Math.max(1, Math.ceil(primeNm / Math.max(1, stepNm * 2)));
+    for (let i = 0; i <= stops; i++) {
       if (token !== bufferToken) return;
-      setPosition(ptsVox[i]);
-      const pct = Math.round((i / Math.max(1, ptsVox.length - 1)) * 100);
-      status(`buffering branch ${pid} ${pct}% -- caching...`);
-      await sleep(120);
+      setPosition(posAt((primeNm * i) / stops));
+      status(`priming branch ${pid} ${Math.round((i / stops) * 100)}% -- caching...`);
+      if (!(await dwellUntilLoaded(1500)) && token === bufferToken) {
+        // Not fatal: the gate will simply hold the camera back here instead. Worth a console note
+        // because a stop that can't complete in 1.5s from LOCAL disk usually means either eviction
+        // pressure or a chunk the server never wrote.
+        console.debug(`[flykernel] prime stop ${i}/${stops} incomplete after 1.5s`);
+      }
     }
     if (token !== bufferToken) return;
     s = 0;
     setPosition(ptsVox[0]);
-    await sleep(400);
+    const startLoaded = await dwellUntilLoaded(1500);
     if (token !== bufferToken) return;
+
+    // Self-check the precise probe exactly once, at the one moment we have an independent answer:
+    // the em layer just reported this view complete, so the chunk under the camera MUST read as
+    // resident. If it doesn't, our grid math disagrees with this layer's transform -- fall back to
+    // the ratio metric rather than crawl the whole branch at the slowdown floor on a bad key.
+    if (startLoaded && !probeVerified && probeUsable) {
+      const pr = resolveProbe();
+      // Only conclude anything when the map has content to disagree with us: an empty map means
+      // the layer hasn't populated it yet, which says nothing about our key math. Concluding
+      // "broken" there is a false negative that permanently downgrades the metric -- exactly the
+      // bug that made this check disable itself on the first run.
+      if (pr && pr.chunks.size > 0) {
+        probeVerified = true;
+        if (!chunkResident(ptsVox[0], pr)) {
+          console.warn(
+            "[flykernel] chunk-probe self-check failed (view complete but containing chunk reads " +
+              "as absent); falling back to view-completeness metric",
+          );
+          probe = null;
+          probeUsable = false;
+        }
+      }
+    }
+    updateBufferDepth();
     phase = "play";
-    running = false; // stay paused after buffering; caller presses play to start
+    running = false; // stay paused after priming; caller presses play to start
     status(`branch ${pid}: ready -- ${ptsVox.length} nodes`, "ok");
   }
 
@@ -287,5 +546,66 @@ export function createFlyKernel(opts: FlyKernelOptions): FlyKernel {
       }
     },
     loadBranch,
+    getBufferDepth: () => depth,
+    // Answers "were these chunks never requested, or were they loaded and then thrown away?" --
+    // the two causes need opposite fixes (more look-ahead vs. a bigger cache), and guessing
+    // between them is how you end up tuning the wrong knob.
+    logCacheDiagnostic: async () => {
+      try {
+        const cq = viewer?.dataContext?.chunkQueueManager;
+        if (!cq) return;
+        // The frontend capacity objects carry only the LIMITS (sizeLimit/itemLimit) -- there is no
+        // current-usage field to read, so actual pressure has to come from getStatistics() below.
+        const gpu = cq.capacities.gpuMemory;
+        console.log(
+          `[flykernel] limits: gpu ${(gpu.sizeLimit.value / 1e9).toFixed(2)}GB / ` +
+            `${gpu.itemLimit.value} items, system ` +
+            `${(cq.capacities.systemMemory.sizeLimit.value / 1e9).toFixed(2)}GB, ` +
+            `${cq.capacities.download.itemLimit.value} concurrent downloads, ` +
+            `prefetch ${cq.enablePrefetch.value ? "on" : "off"}`,
+        );
+        const stats = await cq.getStatistics();
+        // The statistics array is [state][tier][ChunkMemoryStatistics], so the group index has to
+        // be scaled by numChunkMemoryStatistics and then offset to the field you want -- indexing
+        // the group directly reads `numChunks` for one state as a BYTE count of another
+        // (ui/statistics.js is the reference for this).
+        const stat = (arr: Float64Array, state: number, field: number) => {
+          let sum = 0;
+          for (let tier = 0; tier < 3; tier++) {
+            sum += arr[getChunkStateStatisticIndex(state, tier) * numChunkMemoryStatistics + field] ?? 0;
+          }
+          return sum;
+        };
+        let residentTotal = 0;
+        let expiredTotal = 0;
+        let gpuBytes = 0;
+        for (const [source, arr] of stats) {
+          const resident = stat(arr, ChunkState.GPU_MEMORY, ChunkMemoryStatistics.numChunks);
+          const expired = stat(arr, ChunkState.EXPIRED, ChunkMemoryStatistics.numChunks);
+          const bytes = stat(arr, ChunkState.GPU_MEMORY, ChunkMemoryStatistics.gpuMemoryBytes);
+          residentTotal += resident;
+          expiredTotal += expired;
+          gpuBytes += bytes;
+          const name = (source as any)?.constructor?.name ?? "source";
+          console.log(
+            `[flykernel]   ${name}: ${resident} chunks resident ` +
+              `(${(bytes / 1e6).toFixed(1)}MB gpu), ${expired} expired`,
+          );
+        }
+        const gpuPct = ((gpuBytes / gpu.sizeLimit.value) * 100).toFixed(0);
+        console.log(
+          `[flykernel] total ${residentTotal} resident / ${expiredTotal} expired, ` +
+            `${(gpuBytes / 1e6).toFixed(0)}MB gpu = ${gpuPct}% of cap; buffer depth ` +
+            `${Math.round(depth.aheadNm)}/${Math.round(depth.targetNm)}nm ` +
+            `speedFraction=${depth.speedFraction.toFixed(2)} precise=${depth.precise}`,
+        );
+        console.log(
+          "[flykernel] nonzero 'expired' with the camera slowing = eviction (raise the cache cap); " +
+            "zero expired = the loader simply isn't keeping up (look-ahead / mip / speed)",
+        );
+      } catch (e) {
+        console.warn("[flykernel] cache diagnostic failed", e);
+      }
+    },
   };
 }
