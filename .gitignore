@@ -9,6 +9,9 @@ __pycache__/
 .ipynb_checkpoints/
 
 # proofreading session write-ahead logs — track WAL files, ignore large caches
+proofread_sessions/
 proofread_sessions/tube_cache/
 proofread_sessions/renders/
 proofread_sessions/crash_reports/
+share/myelin-tool/proofread_sessions/tube_cache/
+share/myelin-tool/proofread_sessions/renders/
