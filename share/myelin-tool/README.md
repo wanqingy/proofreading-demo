@@ -37,6 +37,21 @@ visible and deletable in Neuroglancer's own **Annotations** panel, not just thro
 Magenta = branch points, white = tips, shown for the whole cell so you can see where the
 current branch sits in the larger arbor.
 
+### Why the camera sometimes slows down
+
+The HUD shows a **buffer** reading, e.g. `buffer 26% -- slowed to 28%`. The camera advances in
+proportion to how much *loaded* EM lies ahead of it, so it can't glide over image data that
+hasn't arrived yet — an unloaded stretch of axon would otherwise look exactly like an
+unmyelinated one, which is a wrong annotation waiting to happen. At the default speed on a
+cached branch it stays at `buffer 100%` and never slows; push the speed slider up and you'll
+see it throttle and recover as the loader catches up.
+
+If it slows more than you'd like, run `flyCache()` in the browser devtools console. It prints
+resident vs **expired** chunk counts and how full the GPU cache is. Nonzero *expired* means
+chunks are being evicted (the cache cap is the problem); zero expired means the loader simply
+isn't keeping up, in which case a lower speed or a coarser mask mip is the lever — raising the
+cache cap would do nothing.
+
 ## What to expect
 
 - **The first branch takes a couple of minutes.** Flying a branch means fetching its EM +
@@ -73,6 +88,19 @@ routinely). Re-running the tool against the same cell resumes exactly where you 
 `proofread_sessions/tube_cache/` is the *other* thing that accumulates there — the downloaded
 EM/mask chunks. That's disposable; `clear_cache.py` above only ever touches that directory
 (it hard-refuses to run anywhere a `.jsonl` file is found, so your tags can't be deleted by it).
+
+**Running this on a different machine than the one collecting the results?** Then those
+`*__myelin.jsonl` files are the only thing worth copying back — everything else in
+`proofread_sessions/` regenerates. They're append-only, so copying one mid-session is safe, and
+each cell's log is self-contained (keyed by seed supervoxel), so per-cell files move
+independently.
+
+Two machines annotating the *same* cell can even be merged by concatenating their logs in any
+order: replay collects tombstones and applies them after reading the whole file, so a delete on
+one machine still wins over a create on the other, and tag uuids are unique per machine. What
+concatenation cannot do is *reconcile* — you get the union of both machines' tags, so if both
+reviewed the same branch you'll have two tags per node to sort out. One machine per cell avoids
+that entirely.
 
 ## Security note
 
