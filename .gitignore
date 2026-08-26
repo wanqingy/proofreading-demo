@@ -11,3 +11,4 @@ __pycache__/
 # proofreading session write-ahead logs — track WAL files, ignore large caches
 proofread_sessions/tube_cache/
 proofread_sessions/renders/
+proofread_sessions/crash_reports/

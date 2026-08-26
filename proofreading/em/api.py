@@ -32,6 +32,8 @@ Endpoints (M1):
     GET    /api/warm-queue                            -- queue status (+ live fill of the cell
                                                           being built now)
     DELETE /api/warm-queue/{root_id}                  -- drop a cell from the queue
+    POST /api/crash-report                            -- append a renderer-kill breadcrumb to
+                                                          <wal_dir>/crash_reports/<tool>.log
     GET  /healthz
     /tube/<datastack>/<root_id>/{em,tgt}/...          -- precomputed chunks (CORS, no-store)
 
@@ -41,7 +43,9 @@ Run via :mod:`proofreading.em.serve`. Single-user, bind to localhost only.
 from __future__ import annotations
 
 import os
+import re
 import threading
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request
@@ -94,6 +98,18 @@ class WarmQueueRequest(BaseModel):
     version: Optional[int] = None
     compartment: Optional[str] = "axon"  # matches the myelin tool's axon-only sweep
     tgt_mip: Optional[int] = None
+
+
+class CrashReportRequest(BaseModel):
+    tool: str  # picks the log FILE, not a path -- validated against _CRASH_TOOL_RE below
+    report: str
+
+
+# renderer-kill breadcrumbs (flykernel's crashwatch) land in <wal_dir>/crash_reports/<tool>.log --
+# `tool` selects the filename, so it's validated against a whitelist rather than trusted as a path.
+_CRASH_TOOL_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
+_CRASH_REPORT_MAX_BYTES = 64_000  # one breadcrumb report; a bad client can't force a huge write
+_CRASH_LOG_MAX_BYTES = 1_000_000  # per-tool log cap -- a crash LOOP must not be able to fill disk
 
 
 def create_app(
@@ -278,6 +294,33 @@ def create_app(
     @app.get("/api/cells/{root_id}/myelin/tags")
     def myelin_tags(root_id: int, path_id: Optional[int] = None):
         return get_session(root_id).myelin_tags(path_id)
+
+    @app.post("/api/crash-report")
+    def crash_report(req: CrashReportRequest):
+        # A renderer kill (blank page) leaves no console and no in-page handler -- flykernel's
+        # crashwatch instead persists a breadcrumb to localStorage and POSTs it here on the next
+        # load, so it's readable from the terminal on a remote/headless machine.
+        if not _CRASH_TOOL_RE.match(req.tool):
+            raise HTTPException(400, "invalid tool name")
+        body = req.report.encode("utf-8", errors="replace")
+        if len(body) > _CRASH_REPORT_MAX_BYTES:
+            raise HTTPException(413, "report too large")
+        crash_dir = os.path.join(wal_dir, "crash_reports")
+        os.makedirs(crash_dir, exist_ok=True)
+        path = os.path.join(crash_dir, f"{req.tool}.log")
+        entry = f"\n=== {datetime.now(timezone.utc).isoformat()} ===\n{req.report}\n".encode(
+            "utf-8", errors="replace"
+        )
+        existing = b""
+        if os.path.isfile(path):
+            with open(path, "rb") as f:
+                existing = f.read()
+        data = existing + entry
+        if len(data) > _CRASH_LOG_MAX_BYTES:
+            data = data[-_CRASH_LOG_MAX_BYTES:]  # oldest entries drop first
+        with open(path, "wb") as f:
+            f.write(data)
+        return {"ok": True}
 
     @app.on_event("shutdown")
     def _close_sessions():

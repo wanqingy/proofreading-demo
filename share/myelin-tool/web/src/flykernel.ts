@@ -17,6 +17,7 @@ import {
   getChunkStateStatisticIndex,
   numChunkMemoryStatistics,
 } from "neuroglancer/unstable/chunk_manager/base.js";
+import { startCrashWatch, type CrashWatch } from "./crashwatch";
 
 // Red overlay for the target-mask layer -- mirrors proofreading/em/tube.py `_TINT`.
 const TINT = `void main() {
@@ -52,6 +53,10 @@ export interface FlyKernelOptions {
   // (e.g. "axon" for the myelin tool) instead of the unfiltered, error-review-coverage default
   // -- see proofreading/em/service.py's _queue_prebuild docstring.
   compartment?: string;
+  // Neuroglancer's velocity-based prefetch (default on -- see setupViewer). Exposed so it can be
+  // turned off WITHOUT a rebuild when diagnosing a renderer kill: prefetch adds download/decode
+  // churn on top of the chunk caps, which makes it the first suspect to rule out.
+  prefetch?: boolean;
   // last chance to extend/replace the viewer state before it is restored. Layers that must
   // exist at viewer-construction time (e.g. a live segmentation/skeleton source, which also
   // needs its credentials registered BEFORE setupDefaultViewer runs) belong here rather than
@@ -91,6 +96,9 @@ export interface FlyKernel {
   getCurrentPositionNm(): [number, number, number] | null;
   loadBranch(pid: number): Promise<Camera>;
   getBufferDepth(): BufferDepth;
+  /** Summary of the previous session if it died without a clean exit (blank page / renderer
+   * kill), else null. Read at startup -- the evidence is in localStorage, not the console. */
+  getCrashReport(): string | null;
   // one-shot console dump: per-source chunk counts + cache pressure, to tell "chunks were never
   // requested" apart from "chunks were loaded and then evicted"
   logCacheDiagnostic(): Promise<void>;
@@ -178,6 +186,60 @@ export function createFlyKernel(opts: FlyKernelOptions): FlyKernel {
   let probeVerified = false;
   let depth: BufferDepth = { aheadNm: 0, targetNm: 0, speedFraction: 1, precise: false };
   let speedFraction = 1; // smoothed, so motion doesn't judder as chunks land
+  let branchLoads = 0; // cumulative -- the old renderer kill grew with branch SWITCHES, not time
+
+  // Cache pressure, refreshed on a slow cadence (see sampleAsyncStats) rather than read fresh each
+  // tick: getStatistics() is an RPC to the worker, and polling it every second would perturb the
+  // very memory behavior this is trying to measure.
+  let asyncStats: { gpuMB: number; systemMB: number; expired: number } | null = null;
+
+  async function sampleAsyncStats() {
+    try {
+      const cq = viewer?.dataContext?.chunkQueueManager;
+      if (!cq) return;
+      const stats = await cq.getStatistics();
+      // Same indexing as logCacheDiagnostic below: [state][tier][ChunkMemoryStatistics], group
+      // scaled by numChunkMemoryStatistics then offset to the field (ui/statistics.js).
+      const stat = (arr: Float64Array, state: number, field: number) => {
+        let sum = 0;
+        for (let tier = 0; tier < 3; tier++) {
+          sum += arr[getChunkStateStatisticIndex(state, tier) * numChunkMemoryStatistics + field] ?? 0;
+        }
+        return sum;
+      };
+      let gpuBytes = 0;
+      let systemBytes = 0;
+      let expired = 0;
+      for (const [, arr] of stats) {
+        gpuBytes += stat(arr, ChunkState.GPU_MEMORY, ChunkMemoryStatistics.gpuMemoryBytes);
+        systemBytes += stat(arr, ChunkState.GPU_MEMORY, ChunkMemoryStatistics.systemMemoryBytes);
+        expired += stat(arr, ChunkState.EXPIRED, ChunkMemoryStatistics.numChunks);
+      }
+      asyncStats = { gpuMB: Math.round(gpuBytes / 1e6), systemMB: Math.round(systemBytes / 1e6), expired };
+    } catch {
+      /* best-effort -- diagnostics must never throw into the caller */
+    }
+  }
+  window.setInterval(sampleAsyncStats, 10000);
+
+  // Records a rolling trail to localStorage so a renderer kill (blank page) leaves evidence.
+  // Per-second fields are cheap, already-maintained numbers; gpuMB/systemMB/expired come from the
+  // slow sampler above instead of calling getStatistics() here directly.
+  const crash: CrashWatch = startCrashWatch({
+    getStats: () => ({
+      chunks: probe?.chunks.size ?? -1,
+      branchLoads,
+      pid: currentPid,
+      phase,
+      speed,
+      aheadNm: Math.round(depth.aheadNm),
+      frac: Number(depth.speedFraction.toFixed(2)),
+      layers: viewer?.layerManager?.managedLayers?.length ?? -1,
+      gpuMB: asyncStats?.gpuMB ?? -1,
+      systemMB: asyncStats?.systemMB ?? -1,
+      expired: asyncStats?.expired ?? -1,
+    }),
+  });
 
   function emUserLayer(): any {
     const managed = viewer?.layerManager?.managedLayers ?? [];
@@ -374,7 +436,7 @@ export function createFlyKernel(opts: FlyKernelOptions): FlyKernel {
       // window full. Caveat worth knowing: MAX_PREFETCH_VELOCITY=0.1 global-voxels/ms means
       // prefetch quietly disengages per-dimension above ~1600nm/s at 16nm voxels, so at the top of
       // the speed slider the proportional slowdown carries it alone.
-      cq.enablePrefetch.value = true;
+      cq.enablePrefetch.value = opts.prefetch !== false;
     } catch (e) {
       console.warn("[flykernel] could not set cache limits", e);
     }
@@ -385,6 +447,9 @@ export function createFlyKernel(opts: FlyKernelOptions): FlyKernel {
         e.preventDefault();
         status("WebGL context lost (GPU memory) -- reload the page", "warn");
         console.error("[flykernel] webglcontextlost");
+        // Into the breadcrumb too: a context loss that PRECEDES a blank page distinguishes a
+        // GPU-side failure from a renderer OOM, which leaves no such note.
+        crash.note("webglcontextlost");
       });
     } catch {
       /* ignore */
@@ -496,6 +561,8 @@ export function createFlyKernel(opts: FlyKernelOptions): FlyKernel {
   }
 
   async function loadBranch(pid: number): Promise<Camera> {
+    branchLoads++;
+    crash.note(`loadBranch ${pid} (#${branchLoads})`);
     await opts.onBeforeLoadBranch?.(pid);
     bufferToken++; // stop any current buffering immediately
     phase = "buffer";
@@ -547,6 +614,7 @@ export function createFlyKernel(opts: FlyKernelOptions): FlyKernel {
     },
     loadBranch,
     getBufferDepth: () => depth,
+    getCrashReport: () => crash.report(),
     // Answers "were these chunks never requested, or were they loaded and then thrown away?" --
     // the two causes need opposite fixes (more look-ahead vs. a bigger cache), and guessing
     // between them is how you end up tuning the wrong knob.

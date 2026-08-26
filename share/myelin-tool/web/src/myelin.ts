@@ -443,6 +443,9 @@ const kernel = createFlyKernel({
   api: API,
   rootId: ROOT_ID,
   compartment: "axon", // scopes background pre-build to the myelin tool's own axon sequence
+  // prefetch is the newest suspect for the renderer-kill crash -- keep it on by default but let a
+  // crashy session be A/B'd with ?prefetch=0 without a rebuild.
+  prefetch: params.get("prefetch") !== "0",
   onStatus: status,
   onProgress,
   onBuildViewerState: buildViewerState,
@@ -452,6 +455,23 @@ const kernel = createFlyKernel({
     drawSkeletonFeatures(); // whole-cell branch/end markers (once; positions are root-invariant)
   },
 });
+
+// If the previous session ended without a clean exit (blank page / renderer kill), the evidence
+// survived in localStorage -- surface it now, before it's overwritten by this session's own
+// crashwatch recorder. Report to the backend too, so it's readable from the terminal on a
+// headless/remote machine that only has this README, not DevTools.
+const crashReport = kernel.getCrashReport();
+if (crashReport) {
+  console.warn(`[myelin] previous session ended without a clean exit:\n${crashReport}`);
+  const notice = $("crashnotice");
+  notice.textContent = "previous session crashed -- see console (also reported to the backend log)";
+  notice.style.display = "";
+  fetch(`${API}/api/crash-report`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ tool: "myelin", report: crashReport }),
+  }).catch((e) => console.warn("[myelin] crash-report POST failed", e));
+}
 
 // `flyCache()` in the devtools console: dumps cache pressure + resident/expired chunk counts, to
 // tell a look-ahead problem from an eviction problem when a branch keeps slowing down.

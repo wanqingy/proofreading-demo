@@ -65,6 +65,7 @@ FRONTEND_FILES = [
     "web/myelin.html",
     "web/src/myelin.ts",
     "web/src/flykernel.ts",
+    "web/src/crashwatch.ts",
     "web/package.json",
     "web/package-lock.json",
     "web/tsconfig.json",

@@ -52,6 +52,33 @@ chunks are being evicted (the cache cap is the problem); zero expired means the 
 isn't keeping up, in which case a lower speed or a coarser mask mip is the lever — raising the
 cache cap would do nothing.
 
+### If the page goes blank
+
+A page that goes fully blank — HUD and all, since the HUD is ordinary HTML — means Chrome killed
+the **tab's process**, almost always for using too much memory. That's different from an error
+message appearing in the HUD (a JS bug, still recoverable) or a "WebGL context lost" warning
+(GPU-side, also still recoverable): a real process kill happens with no warning and nothing left
+in the console, so there's normally nothing to go on after it happens.
+
+This tool leaves a breadcrumb for that case: every second it stashes a few numbers (JS heap,
+chunk-cache size, GPU/system memory, how many branches you've loaded) in the browser's local
+storage, which survives the tab dying because it lives in the browser process, not the tab's.
+Reload after a blank-page crash and:
+
+- The HUD shows **"previous session crashed"**, and the full detail — a table of the last ~12
+  samples before it died — is logged to the browser console (`F12` → Console).
+- The same detail is appended to `proofread_sessions/crash_reports/myelin.log` on whichever
+  machine is running the backend, so it's readable from a terminal even without opening
+  DevTools. If you're asking for help with a crash, that file's last entry is the thing to send.
+
+Reading it: heap climbing toward its limit points at a JS-side leak; a growing chunk count with
+no matching drop in "expired" points at the chunk cache outgrowing its eviction; a
+`webglcontextlost` note right before the end points at the GPU instead of the tab itself.
+
+If it keeps happening, try `http://localhost:8000/?prefetch=0` — this disables neuroglancer's
+own look-ahead prefetching, the newest piece of the caching machinery and the first thing worth
+ruling out, without needing to rebuild anything.
+
 ## What to expect
 
 - **The first branch takes a couple of minutes.** Flying a branch means fetching its EM +
