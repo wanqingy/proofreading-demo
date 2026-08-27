@@ -52,7 +52,32 @@ chunks are being evicted (the cache cap is the problem); zero expired means the 
 isn't keeping up, in which case a lower speed or a coarser mask mip is the lever — raising the
 cache cap would do nothing.
 
-### If the page goes blank
+### If you zoom out, expect black around the edges
+
+Only a narrow strip of image is downloaded around the axon — roughly ±1.2 µm. Zoom out past the
+default and the view quickly extends beyond it, and those areas are **black because there is no
+image there**, not because it is still loading. Waiting will never fill them.
+
+The HUD says so explicitly when it happens, e.g. `36% of the centre of this view has NO image`. That
+warning matters for tagging: black and unmyelinated look identical on screen, so treat any black
+region as "no data", never as "unmyelinated".
+
+Measured, so you know what to expect (fraction of the middle of the view with no image):
+
+| zoom | default | 2× out | 4× out | 8× out |
+|---|---|---|---|---|
+| no image | 0% | 25% | 36% | 73% |
+
+Zooming out also slows loading down, badly, while the camera is flying — at 8× out it took **10 s**
+for the view to fill versus **2.5 s** once look-ahead loading was disabled. The tool now turns
+look-ahead off automatically past 4× out for exactly this reason, so you should not have to think
+about it. If you want the old behaviour for comparison, `?prefetch=0` forces it off at all zooms.
+
+Two things that will *not* help, both measured rather than guessed: raising the number of concurrent
+downloads (the browser only opens 6 connections no matter what the setting says), and waiting longer
+(the missing tiles do not exist). Zooming back in is the only way to see image everywhere.
+
+### If the page goes blank or freezes
 
 A page that goes fully blank — HUD and all, since the HUD is ordinary HTML — means Chrome killed
 the **tab's process**, almost always for using too much memory. That's different from an error
@@ -65,19 +90,22 @@ chunk-cache size, GPU/system memory, how many branches you've loaded) in the bro
 storage, which survives the tab dying because it lives in the browser process, not the tab's.
 Reload after a blank-page crash and:
 
-- The HUD shows **"previous session crashed"**, and the full detail — a table of the last ~12
-  samples before it died — is logged to the browser console (`F12` → Console).
+- The HUD shows **"previous session crashed or froze"**, and the full detail — a table of the last
+  ~12 samples before it ended — is logged to the browser console (`F12` → Console).
 - The same detail is appended to `proofread_sessions/crash_reports/myelin.log` on whichever
   machine is running the backend, so it's readable from a terminal even without opening
   DevTools. If you're asking for help with a crash, that file's last entry is the thing to send.
 
-Reading it: heap climbing toward its limit points at a JS-side leak; a growing chunk count with
-no matching drop in "expired" points at the chunk cache outgrowing its eviction; a
-`webglcontextlost` note right before the end points at the GPU instead of the tab itself.
+**Freezing is reported too, and it is a different fault.** A tab can also lock up solid — no
+response for many seconds — while its process stays alive. That is not a crash: it recovers, and it
+would leave no trace, because the recorder is frozen along with everything else. So the recorder also
+measures how late each of its own samples was, and reports `previous session FROZE: main thread
+blocked for N s`. Zooming far out while the camera is flying is a known way to trigger this, which is
+another reason the tool now limits look-ahead loading when you zoom out.
 
-If it keeps happening, try `http://localhost:8000/?prefetch=0` — this disables neuroglancer's
-own look-ahead prefetching, the newest piece of the caching machinery and the first thing worth
-ruling out, without needing to rebuild anything.
+Reading the report: heap climbing toward its limit points at a JS-side leak; a `webglcontextlost`
+note right before the end points at the GPU rather than the tab; a large `stallMs` points at the main
+thread being overwhelmed rather than memory.
 
 ## What to expect
 

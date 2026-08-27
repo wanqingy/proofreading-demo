@@ -395,17 +395,48 @@ function renderBufferDepth(phase: "buffer" | "play") {
     return;
   }
   const pct = Math.round((d.aheadNm / d.targetNm) * 100);
+  const realPct = Math.round((d.realAheadNm / d.targetNm) * 100);
   const slowed = d.speedFraction < 0.95;
-  el.textContent = slowed
-    ? `buffer ${pct}% -- slowed to ${Math.round(d.speedFraction * 100)}%${d.precise ? "" : " (approx)"}`
-    : `buffer ${pct}%`;
-  el.className = slowed ? "warn" : "";
+  // Report the two numbers separately when they disagree. They disagree exactly when the path ahead
+  // includes chunks the server has already told us do not exist -- which render BLACK and which the
+  // old single `buffer %` counted as loaded, so it read 100% over blank EM. Since blank and
+  // unmyelinated look identical, that reading was a wrong-annotation hazard, not a cosmetic one.
+  const parts: string[] = [];
+  if (realPct < pct) parts.push(`buffer ${pct}% (only ${realPct}% has data)`);
+  else parts.push(`buffer ${pct}%`);
+  if (slowed) parts.push(`slowed to ${Math.round(d.speedFraction * 100)}%`);
+  if (!d.precise) parts.push("approx");
+  el.textContent = parts.join(" -- ");
+  el.className = slowed || realPct < pct ? "warn" : "";
+}
+
+// Zoomed past the cached strip: the periphery of the panel is black because no EM was ever
+// downloaded there, not because it is still loading. Waiting will never fill it.
+//
+// This is the signal that actually prevents a wrong annotation, because black and unmyelinated look
+// the same on screen -- so it says plainly that the outside of the view is not reviewable, rather
+// than leaving the buffer percentage to imply everything is fine.
+function renderZoomWarning() {
+  const el = $("zoomwarn");
+  try {
+    const v = kernel.getViewInfo();
+    if (!v.nmPerPx || !v.pastStrip) {
+      el.textContent = "";
+      return;
+    }
+    el.textContent =
+      `${Math.round(v.holeFrac * 100)}% of the centre of this view has NO image (zoomed out past ` +
+      `the cached strip) -- black here is missing data, not unmyelinated axon`;
+  } catch {
+    el.textContent = "";
+  }
 }
 
 function onProgress(frac: number, phase: "buffer" | "play") {
   $("progresspct").textContent = phase === "buffer" ? "buffering" : `${(frac * 100).toFixed(0)}%`;
   ($("progress") as HTMLInputElement).value = String(Math.round(frac * 1000));
   renderBufferDepth(phase);
+  renderZoomWarning();
   if (paintMode && phase === "play") {
     const pos = kernel.getCurrentPositionNm();
     const pid = kernel.getCurrentPid();
@@ -462,9 +493,13 @@ const kernel = createFlyKernel({
 // headless/remote machine that only has this README, not DevTools.
 const crashReport = kernel.getCrashReport();
 if (crashReport) {
-  console.warn(`[myelin] previous session ended without a clean exit:\n${crashReport}`);
+  console.warn(`[myelin] previous session ended badly:\n${crashReport}`);
   const notice = $("crashnotice");
-  notice.textContent = "previous session crashed -- see console (also reported to the backend log)";
+  // "crashed or froze": a killed renderer and a renderer wedged for many seconds are different
+  // faults with different fixes, and the report itself says which -- but from the user's seat both
+  // just mean "the last session broke", so the one-liner covers both.
+  notice.textContent =
+    "previous session crashed or froze -- see console (also written to the backend log)";
   notice.style.display = "";
   fetch(`${API}/api/crash-report`, {
     method: "POST",

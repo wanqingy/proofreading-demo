@@ -72,9 +72,50 @@ const LOOKAHEAD_SECONDS = 2;
 // prefetch, so it would have to wait for plain visible-tier loading to dig it out.
 const MIN_SPEED_FRACTION = 0.08;
 
+// Zoom threshold (nm per screen pixel) past which neuroglancer's prefetch stops paying for itself.
+//
+// Measured, because the two regimes pull in opposite directions. The tube is a SINGLE-SCALE volume,
+// so zooming out cannot switch to a coarser level -- it just multiplies the number of full-res tiles
+// the view needs, and nearly all of the extra ones lie outside the tube and 404. Prefetch makes that
+// worse, because it sprays up to 32 tiles per axis along straight lines that the curving axon leaves
+// almost immediately.
+// Measured as time for the VISIBLE footprint to reach 95% of the real (non-empty) chunks it will
+// ever get, with the camera FLYING -- the actual use case. Earlier attempts at this measurement were
+// biased and are worth naming so they aren't repeated: "time until the resident-chunk count
+// plateaus" penalises prefetch by construction (prefetch deliberately loads beyond the view), and
+// neuroglancer's own numVisibleChunksNeeded == numVisibleChunksAvailable ALWAYS, because a 404
+// counts as available -- so its completeness signal cannot see holes at all.
+//   at the default zoom (3.2 nm/px): prefetch HELPS -- look-ahead is what keeps a moving camera fed
+//     (speed fraction 0.68 with it vs 0.46 without, at 2500 nm/s).
+//   at 8x out (25.6 nm/px), flying: prefetch HURTS 4x -- 10132ms to fill the view with it on vs
+//     2504ms with it off. Stationary at the same zoom it makes no difference (402ms either way):
+//     the damage is specific to a moving camera, which keeps entering new territory where prefetch
+//     extrapolates outward past the strip and the doomed requests crowd out the real ones.
+// `download.itemLimit` was measured to be irrelevant in both directions (5032 vs 5030 ms at 16 vs 6,
+// and 1006 vs 1008 with prefetch off): the real ceiling is Chrome's 6 HTTP/1.1 connections per
+// origin -- confirmed by counting sockets, exactly 6 -- so the setting cannot buy concurrency that
+// does not exist. Hence prefetch, not concurrency, is the lever.
+const PREFETCH_MAX_NM_PER_PX = 8;
+const PREFETCH_HYSTERESIS = 1.25; // re-enable only well below the threshold, so it can't flap
+
+// Measured across-path width of the cached tube, for radius_nm = 1000 (which no client overrides --
+// checked: service.py, api.py and both frontends all leave it at the default). tube_chunks() unions
+// +/-1000nm CUBES snapped outward to 64^3 chunk edges, which measured as -1856..+1216 nm around the
+// centerline -- asymmetric, because the centerline sits at an arbitrary offset within its chunk.
+// Take the narrow side: this is used to warn, so erring small errs safe.
+const TUBE_HALF_WIDTH_NM = 1216;
+
+// The warning measures this central fraction of the 2D panel, not the whole thing -- see viewInfo.
+const VIEW_CENTRE_FRACTION = 0.5;
+
 export interface BufferDepth {
-  // arc nm of contiguously-loaded path ahead of the camera (capped at the target window)
+  // arc nm of contiguously-TRAVERSABLE path ahead of the camera (capped at the target window).
+  // "Traversable" counts known-absent chunks as passable -- they are never going to load, so the
+  // camera must not wait for them. This is what gates the speed.
   aheadNm: number;
+  // arc nm of contiguously-REAL (actual bytes) path ahead. <= aheadNm; the gap between them is
+  // path the camera will fly over with nothing to look at. HUD only -- never gates the speed.
+  realAheadNm: number;
   // the window we're trying to keep loaded (arc nm); aheadNm/targetNm drives the speed
   targetNm: number;
   // speed multiplier actually applied this frame, 1 = unimpeded
@@ -99,6 +140,18 @@ export interface FlyKernel {
   /** Summary of the previous session if it died without a clean exit (blank page / renderer
    * kill), else null. Read at startup -- the evidence is in localStorage, not the console. */
   getCrashReport(): string | null;
+  /** What is actually on screen right now: chunks in the 2D panel's footprint classified into real
+   * (has image), absent (404 -- black forever) and pending (still coming). `pastStrip` is true once
+   * a meaningful share of the view is absent, i.e. black for want of DATA rather than of time. */
+  getViewInfo(): {
+    nmPerPx: number;
+    halfViewNm: number;
+    real: number;
+    absent: number;
+    pending: number;
+    holeFrac: number;
+    pastStrip: boolean;
+  };
   // one-shot console dump: per-source chunk counts + cache pressure, to tell "chunks were never
   // requested" apart from "chunks were loaded and then evicted"
   logCacheDiagnostic(): Promise<void>;
@@ -167,7 +220,8 @@ export function createFlyKernel(opts: FlyKernelOptions): FlyKernel {
   // of chunks at crossSectionScale 0.2), so this can read "loaded" for a view still missing edge
   // chunks. Good enough for a depth metric; the speed law only needs a monotone signal.
   interface ChunkProbe {
-    chunks: Map<string, { state: number }>;
+    // `data` is null for a chunk the server 404'd (see classifyChunk) and a typed array otherwise.
+    chunks: Map<string, { state: number; data?: unknown }>;
     chunkDataSize: number[];
     // The chunk grid is anchored at the volume's voxel_offset, NOT at global origin: neuroglancer
     // builds a chunk's voxel bounds as `gridPosition * chunkDataSize + baseVoxelOffset`
@@ -184,7 +238,9 @@ export function createFlyKernel(opts: FlyKernelOptions): FlyKernel {
   let probeAttempts = 0;
   let probeUsable = true; // false -> permanently on the ratio fallback
   let probeVerified = false;
-  let depth: BufferDepth = { aheadNm: 0, targetNm: 0, speedFraction: 1, precise: false };
+  let depth: BufferDepth = {
+    aheadNm: 0, realAheadNm: 0, targetNm: 0, speedFraction: 1, precise: false,
+  };
   let speedFraction = 1; // smoothed, so motion doesn't judder as chunks land
   let branchLoads = 0; // cumulative -- the old renderer kill grew with branch SWITCHES, not time
 
@@ -295,15 +351,27 @@ export function createFlyKernel(opts: FlyKernelOptions): FlyKernel {
     return k.join();
   }
 
-  function chunkResident(p: [number, number, number], pr: ChunkProbe): boolean {
-    const state = pr.chunks.get(chunkKey(p, pr))?.state;
-    if (state === ChunkState.GPU_MEMORY) return true;
-    // A chunk whose fetch already FAILED is never going to arrive -- the tube is sparse and a fill
-    // that hit its time budget leaves real holes (those 404s). Waiting on one would park the camera
-    // at the slowdown floor for ~13s per chunk, so treat it as "nothing to wait for" and glide on.
-    // EXPIRED is deliberately NOT included: an evicted chunk gets re-requested once visible, so
-    // holding back for it is exactly right.
-    return state === ChunkState.FAILED;
+  // Three outcomes, and the distinction matters because two of them look identical on screen:
+  //
+  //   "real"    bytes arrived; this is reviewable EM
+  //   "absent"  the server answered 404, which neuroglancer treats as a SUCCESSFUL empty download:
+  //             `data === null`, promoted to GPU_MEMORY at 0 bytes, painted as the shader fill value
+  //             (black). Nothing will ever arrive here -- the tube is a narrow strip around the
+  //             centerline and this position is outside it.
+  //   "pending" not in the map at all. The frontend map only ever holds SYSTEM_MEMORY/GPU_MEMORY
+  //             (chunk_manager/frontend.js applyChunkUpdate throws on anything else), so NEW /
+  //             QUEUED / DOWNLOADING / FAILED are all simply absent keys -- i.e. still coming.
+  //
+  // There is deliberately no ChunkState.FAILED case: the frontend never sees FAILED (it is a
+  // worker-only state), and a 404 is not a failure anyway. The old code tested for it, which was
+  // unreachable -- the intended "don't wait for a hole" behaviour was happening by accident via the
+  // GPU_MEMORY branch, which is exactly what makes `absent` indistinguishable from `real` today.
+  type ChunkClass = "real" | "absent" | "pending";
+  function classifyChunk(p: [number, number, number], pr: ChunkProbe): ChunkClass {
+    const c = pr.chunks.get(chunkKey(p, pr));
+    if (c === undefined) return "pending";
+    if (c.state !== ChunkState.GPU_MEMORY) return "pending"; // SYSTEM_MEMORY: awaiting GPU upload
+    return c.data == null ? "absent" : "real";
   }
 
   // Fallback metric: completeness of the CURRENT view only, from the counters the worker keeps
@@ -331,19 +399,136 @@ export function createFlyKernel(opts: FlyKernelOptions): FlyKernel {
     }
   }
 
-  // Arc nm of loaded path ahead of `fromArc`, capped at `capNm`.
-  function loadedAheadNm(fromArc: number, capNm: number): number {
+  // Two different questions about the path ahead, answered in ONE walk because they need different
+  // stopping rules:
+  //
+  //   traversableNm -- stops only at "pending". Drives the camera speed. A hole must NOT stop the
+  //                    camera: nothing is ever going to arrive there, so waiting would park us at
+  //                    the slowdown floor forever.
+  //   realNm        -- stops at "pending" OR "absent". Drives the HUD only. This is the honest
+  //                    "how much reviewable EM is ahead of me" number, and it is the one that must
+  //                    never claim coverage we do not have.
+  function aheadNm(fromArc: number, capNm: number): { traversableNm: number; realNm: number } {
     const pr = resolveProbe();
     if (!pr) {
       // Fallback: scale the window by how complete the current view is. No telemetry -> assume
       // clear, so a missing metric can never be the thing that slows the fly-through down.
-      return capNm * (viewCompleteness() ?? 1);
+      const f = capNm * (viewCompleteness() ?? 1);
+      return { traversableNm: f, realNm: f };
     }
     const step = Math.max(1, pr.minSpanNm / 2); // half a chunk: can't skip a boundary
+    let realNm = -1;
     for (let d = 0; d <= capNm; d += step) {
-      if (!chunkResident(posAt(fromArc + d), pr)) return d;
+      const k = classifyChunk(posAt(fromArc + d), pr);
+      if (realNm < 0 && k !== "real") realNm = d; // first non-real position ends the real run
+      if (k === "pending") return { traversableNm: d, realNm: realNm < 0 ? d : realNm };
     }
-    return capNm;
+    return { traversableNm: capNm, realNm: realNm < 0 ? capNm : realNm };
+  }
+
+  // Turn prefetch off once zoomed out past the point where it pays for itself, and back on when
+  // zoomed back in. See PREFETCH_MAX_NM_PER_PX for the measurements behind the threshold.
+  //
+  // `zoomFactor` is canonical voxels per screen pixel, and the canonical voxel here is the finest
+  // axis of the tube's own resolution (the viewer's dimensions are built from `resolution_nm`), so
+  // nm/px is zoomFactor * min(resNm). Read rather than watched: one property read on an existing
+  // 6-frame cadence is cheaper than owning a listener's lifetime.
+  // What the user is ACTUALLY looking at: classify every chunk inside the 2D panel's footprint.
+  //
+  // Deliberately measured rather than predicted from radius_nm. A geometric prediction cries wolf:
+  // at the default zoom the view half-width (~1280nm) already exceeds the straight-path tube
+  // half-width (1216nm), yet the view measures ZERO holes -- because the tube is a union of boxes
+  // ALONG the path, so wherever the axon runs across the viewing plane the real coverage is much
+  // wider than the worst case. Counting beats predicting.
+  //
+  // Cost is one Map lookup per chunk in the footprint (8 at the default zoom, a few hundred zoomed
+  // far out), on the same 6-frame cadence as everything else here.
+  function viewInfo(): {
+    nmPerPx: number;
+    halfViewNm: number;
+    real: number;
+    absent: number;
+    pending: number;
+    holeFrac: number;
+    pastStrip: boolean;
+  } {
+    let nmPerPx = 0;
+    let panelPx = window.innerWidth / 2;
+    let panelPy = window.innerHeight;
+    try {
+      const zoom = viewer?.navigationState?.zoomFactor?.value;
+      if (zoom > 0) nmPerPx = zoom * Math.min(...resNm);
+      const c = viewer?.display?.canvas as HTMLCanvasElement | undefined;
+      if (c?.clientWidth) panelPx = c.clientWidth / 2; // xy-3d splits horizontally
+      if (c?.clientHeight) panelPy = c.clientHeight;
+    } catch {
+      /* fall back to window size */
+    }
+    const halfViewNm = (nmPerPx * panelPx) / 2;
+    const none = { nmPerPx, halfViewNm, real: 0, absent: 0, pending: 0, holeFrac: 0, pastStrip: false };
+    const pr = resolveProbe();
+    const posVox = viewer?.navigationState?.pose?.position?.value;
+    if (!pr || !posVox || posVox.length !== 3 || !nmPerPx) return none;
+    // half-extent of the panel in VOXELS on each display axis (zoom is voxels per pixel), scaled to
+    // the CENTRAL region rather than the whole panel.
+    //
+    // Why the centre: the axon is centred in frame and that is where myelination is judged, so a
+    // hole there is what could actually be misread as unmyelinated. Measuring the full panel makes
+    // the warning fire on edge chunks that are outside the strip by chunk-grid rounding -- measured
+    // 25% "holes" at the DEFAULT zoom at one position, which would put a permanent warning on screen
+    // and train the user to ignore it. A warning that is always on is worth nothing.
+    const zoom = nmPerPx / Math.min(...resNm);
+    const hx = (zoom * panelPx * VIEW_CENTRE_FRACTION) / 2;
+    const hy = (zoom * panelPy * VIEW_CENTRE_FRACTION) / 2;
+    const cIdx = (v: number, d: number) =>
+      clamp(
+        Math.floor((v - pr.baseVoxelOffset[d]) / pr.chunkDataSize[d]),
+        pr.lowerChunkBound[d],
+        pr.upperChunkBound[d] - 1,
+      );
+    const x0 = cIdx(posVox[0] - hx, 0), x1 = cIdx(posVox[0] + hx, 0);
+    const y0 = cIdx(posVox[1] - hy, 1), y1 = cIdx(posVox[1] + hy, 1);
+    const z0 = cIdx(posVox[2], 2);
+    let real = 0, absent = 0, pending = 0;
+    for (let x = x0; x <= x1; x++) {
+      for (let y = y0; y <= y1; y++) {
+        const c = pr.chunks.get([x, y, z0].join());
+        if (c === undefined || c.state !== ChunkState.GPU_MEMORY) pending++;
+        else if (c.data == null) absent++;
+        else real++;
+      }
+    }
+    const known = real + absent;
+    const holeFrac = known > 0 ? absent / known : 0;
+    // 10%: below that it's chunk-grid rounding at the panel edge, not a coverage problem worth
+    // interrupting the user about.
+    return { nmPerPx, halfViewNm, real, absent, pending, holeFrac, pastStrip: holeFrac > 0.1 };
+  }
+
+  let prefetchOn: boolean | null = null;
+  function updatePrefetchForZoom() {
+    if (opts.prefetch === false) return; // explicitly forced off (?prefetch=0) -- never re-enable
+    try {
+      const cq = viewer?.dataContext?.chunkQueueManager;
+      const zoom = viewer?.navigationState?.zoomFactor?.value;
+      if (!cq || !(zoom > 0)) return;
+      const nmPerPx = zoom * Math.min(...resNm);
+      // hysteresis: drop out above the threshold, come back only well below it
+      const want =
+        prefetchOn === false
+          ? nmPerPx < PREFETCH_MAX_NM_PER_PX / PREFETCH_HYSTERESIS
+          : nmPerPx <= PREFETCH_MAX_NM_PER_PX;
+      if (want !== prefetchOn) {
+        prefetchOn = want;
+        cq.enablePrefetch.value = want;
+        console.debug(
+          `[flykernel] prefetch ${want ? "on" : "off"} (${nmPerPx.toFixed(1)} nm/px` +
+            `${want ? "" : " -- zoomed out past the cached strip; look-ahead would mostly miss"})`,
+        );
+      }
+    } catch {
+      /* never let a zoom read break the frame loop */
+    }
   }
 
   // Re-measure buffer depth and update the smoothed speed multiplier. Cheap (a handful of Map
@@ -356,15 +541,23 @@ export function createFlyKernel(opts: FlyKernelOptions): FlyKernel {
     const remaining = Math.max(0, totalArc - s);
     const target = Math.min(window, remaining);
     if (target <= 0) {
-      depth = { aheadNm: 0, targetNm: 0, speedFraction: 1, precise: !!probe };
+      depth = { aheadNm: 0, realAheadNm: 0, targetNm: 0, speedFraction: 1, precise: !!probe };
       speedFraction = 1;
       return;
     }
-    const ahead = loadedAheadNm(s, target);
-    const wanted = clamp(ahead / target, MIN_SPEED_FRACTION, 1);
+    const { traversableNm, realNm } = aheadNm(s, target);
+    // Speed is gated on TRAVERSABLE, not real: see aheadNm. A stretch that is genuinely absent must
+    // not brake the camera, or the camera would never get past it.
+    const wanted = clamp(traversableNm / target, MIN_SPEED_FRACTION, 1);
     // ease toward the target so chunks landing mid-glide don't snap the speed
     speedFraction += (wanted - speedFraction) * 0.25;
-    depth = { aheadNm: ahead, targetNm: target, speedFraction, precise: !!probe };
+    depth = {
+      aheadNm: traversableNm,
+      realAheadNm: realNm,
+      targetNm: target,
+      speedFraction,
+      precise: !!probe,
+    };
   }
 
   const frame = (now: number) => {
@@ -385,6 +578,10 @@ export function createFlyKernel(opts: FlyKernelOptions): FlyKernel {
       }
       setPosition(posAt(s));
     }
+
+    // Outside the play branch on purpose: the user can zoom while PAUSED, which is exactly when
+    // they're inspecting, and that is the case where a wrong prefetch setting costs the most.
+    if (frames % 6 === 0) updatePrefetchForZoom();
 
     if (frames % 6 === 0 && !scrubbing) {
       const frac = totalArc > 0 ? s / totalArc : 0;
@@ -544,10 +741,13 @@ export function createFlyKernel(opts: FlyKernelOptions): FlyKernel {
       // bug that made this check disable itself on the first run.
       if (pr && pr.chunks.size > 0) {
         probeVerified = true;
-        if (!chunkResident(ptsVox[0], pr)) {
+        // Only "pending" indicts the key math: it means our computed key found NOTHING in the map,
+        // even though the layer just reported this view complete. "absent" is a real answer (the
+        // key WAS found, holding a 404's null data), so it proves the math works.
+        if (classifyChunk(ptsVox[0], pr) === "pending") {
           console.warn(
-            "[flykernel] chunk-probe self-check failed (view complete but containing chunk reads " +
-              "as absent); falling back to view-completeness metric",
+            "[flykernel] chunk-probe self-check failed (view complete but containing chunk is not " +
+              "in the chunk map at all); falling back to view-completeness metric",
           );
           probe = null;
           probeUsable = false;
@@ -615,6 +815,7 @@ export function createFlyKernel(opts: FlyKernelOptions): FlyKernel {
     loadBranch,
     getBufferDepth: () => depth,
     getCrashReport: () => crash.report(),
+    getViewInfo: viewInfo,
     // Answers "were these chunks never requested, or were they loaded and then thrown away?" --
     // the two causes need opposite fixes (more look-ahead vs. a bigger cache), and guessing
     // between them is how you end up tuning the wrong knob.
@@ -645,31 +846,46 @@ export function createFlyKernel(opts: FlyKernelOptions): FlyKernel {
           return sum;
         };
         let residentTotal = 0;
-        let expiredTotal = 0;
+        let queuedTotal = 0;
         let gpuBytes = 0;
         for (const [source, arr] of stats) {
           const resident = stat(arr, ChunkState.GPU_MEMORY, ChunkMemoryStatistics.numChunks);
-          const expired = stat(arr, ChunkState.EXPIRED, ChunkMemoryStatistics.numChunks);
+          // The real eviction signal. ChunkState.EXPIRED is NEVER assigned in neuroglancer 2.41.2
+          // (grep: only the enum, the wire message, and the frontend delete) so its statistics
+          // buckets are permanently zero -- this diagnostic used to report it and advise on it,
+          // which could never fire. Eviction actually moves a chunk back to QUEUED, so a QUEUED
+          // count that climbs while the camera stalls is what "the cache is thrashing" looks like.
+          const queued = stat(arr, ChunkState.QUEUED, ChunkMemoryStatistics.numChunks);
           const bytes = stat(arr, ChunkState.GPU_MEMORY, ChunkMemoryStatistics.gpuMemoryBytes);
           residentTotal += resident;
-          expiredTotal += expired;
+          queuedTotal += queued;
           gpuBytes += bytes;
           const name = (source as any)?.constructor?.name ?? "source";
           console.log(
             `[flykernel]   ${name}: ${resident} chunks resident ` +
-              `(${(bytes / 1e6).toFixed(1)}MB gpu), ${expired} expired`,
+              `(${(bytes / 1e6).toFixed(1)}MB gpu), ${queued} queued`,
           );
         }
         const gpuPct = ((gpuBytes / gpu.sizeLimit.value) * 100).toFixed(0);
+        const vi = viewInfo();
         console.log(
-          `[flykernel] total ${residentTotal} resident / ${expiredTotal} expired, ` +
+          `[flykernel] total ${residentTotal} resident / ${queuedTotal} queued, ` +
             `${(gpuBytes / 1e6).toFixed(0)}MB gpu = ${gpuPct}% of cap; buffer depth ` +
-            `${Math.round(depth.aheadNm)}/${Math.round(depth.targetNm)}nm ` +
+            `${Math.round(depth.aheadNm)}nm traversable / ${Math.round(depth.realAheadNm)}nm with ` +
+            `data, of ${Math.round(depth.targetNm)}nm wanted; ` +
             `speedFraction=${depth.speedFraction.toFixed(2)} precise=${depth.precise}`,
         );
         console.log(
-          "[flykernel] nonzero 'expired' with the camera slowing = eviction (raise the cache cap); " +
-            "zero expired = the loader simply isn't keeping up (look-ahead / mip / speed)",
+          `[flykernel] zoom ${vi.nmPerPx.toFixed(1)} nm/px -> view half-width ` +
+            `${Math.round(vi.halfViewNm)}nm vs cached strip ~${TUBE_HALF_WIDTH_NM}nm` +
+            (vi.pastStrip
+              ? " -- PAST THE STRIP: the periphery is black for want of data, not time, and " +
+                "prefetch is disabled here because its look-ahead would mostly miss"
+              : " -- view fits inside the strip"),
+        );
+        console.log(
+          "[flykernel] a climbing 'queued' while the camera stalls = eviction thrashing; " +
+            "steady queued with a stalled camera = the loader isn't keeping up (speed / zoom)",
         );
       } catch (e) {
         console.warn("[flykernel] cache diagnostic failed", e);

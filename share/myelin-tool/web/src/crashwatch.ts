@@ -25,10 +25,19 @@ export interface CrashRecord {
   url: string;
   samples: CrashSample[];
   notes: { t: number; what: string }[];
+  /** Longest observed main-thread freeze (ms beyond the sampling interval), and when it happened.
+   * A freeze is NOT a crash -- the tab exits cleanly afterwards -- but it is just as unusable, so
+   * it is reported separately rather than being invisible. */
+  maxStallMs: number;
+  maxStallAt: number;
 }
+
+/** A freeze worth telling the user about. Below this it's ordinary GC / tab throttling noise. */
+const STALL_REPORT_MS = 3000;
 
 export interface PreviousSession {
   crashed: boolean; // had samples but never recorded a clean exit
+  froze: boolean; // exited cleanly, but the main thread was blocked long enough to be unusable
   record: CrashRecord;
   ageMs: number;
 }
@@ -49,8 +58,11 @@ function readPrevious(): PreviousSession | null {
     if (!raw) return null;
     const record = JSON.parse(raw) as CrashRecord;
     if (!record?.samples?.length) return null;
+    record.maxStallMs ??= 0; // records written before stall tracking existed
+    record.maxStallAt ??= 0;
     return {
       crashed: !record.cleanExit,
+      froze: record.maxStallMs >= STALL_REPORT_MS,
       record,
       ageMs: Date.now() - record.startedAt,
     };
@@ -82,6 +94,8 @@ export function startCrashWatch(opts: {
     url: location.href,
     samples: [],
     notes: [],
+    maxStallMs: 0,
+    maxStallAt: 0,
   };
   const t0 = performance.now();
   let dirty = false;
@@ -96,6 +110,9 @@ export function startCrashWatch(opts: {
     }
   };
 
+  const interval = opts.intervalMs ?? 1000;
+  let lastTickAt = performance.now();
+
   const tick = () => {
     let stats: Record<string, number | string | null> = {};
     try {
@@ -103,7 +120,24 @@ export function startCrashWatch(opts: {
     } catch {
       stats = { statsError: 1 };
     }
-    record.samples.push({ t: Math.round(performance.now() - t0), ...heapFields(), ...stats });
+    // How late this tick was tells us the main thread was BLOCKED, which is the failure mode a
+    // death-only recorder cannot see. A frozen tab keeps its process (so `pagehide` still runs on
+    // navigation and the session is recorded as a clean exit) while being just as unusable as a
+    // crash -- observed for real here: the page stopped answering for 8s+ while zoomed far out and
+    // flying, then navigated away normally and reported nothing.
+    const now = performance.now();
+    const stallMs = Math.max(0, Math.round(now - lastTickAt - interval));
+    lastTickAt = now;
+    if (stallMs > record.maxStallMs) {
+      record.maxStallMs = stallMs;
+      record.maxStallAt = Math.round(now - t0);
+    }
+    record.samples.push({
+      t: Math.round(now - t0),
+      ...(stallMs > interval ? { stallMs } : {}),
+      ...heapFields(),
+      ...stats,
+    });
     if (record.samples.length > MAX_SAMPLES) record.samples.shift();
     dirty = true;
     flush(); // flush every sample: the whole point is to survive an unannounced kill
@@ -136,12 +170,20 @@ export function startCrashWatch(opts: {
     },
     previous: () => previous,
     report() {
-      if (!previous?.crashed) return null;
+      // Two distinct bad endings, both worth reporting and each needing a different fix:
+      //   crashed -- the renderer was killed; no clean exit was ever recorded
+      //   froze   -- the renderer survived (so it exited cleanly) but the main thread was blocked
+      //              long enough to be unusable. Invisible to a death-only check.
+      if (!previous || (!previous.crashed && !previous.froze)) return null;
       const { record: r, ageMs } = previous;
       const tail = r.samples.slice(-12);
       const keys = Object.keys(tail[tail.length - 1] ?? {}).filter((k) => k !== "t");
+      const headline = previous.crashed
+        ? `previous session ended WITHOUT a clean exit (renderer killed)`
+        : `previous session FROZE: main thread blocked for ${(r.maxStallMs / 1000).toFixed(1)}s ` +
+          `at t+${(r.maxStallAt / 1000).toFixed(0)}s (it exited cleanly afterwards)`;
       const lines = [
-        `previous session ended WITHOUT a clean exit ${Math.round(ageMs / 1000)}s ago ` +
+        `${headline} ${Math.round(ageMs / 1000)}s ago ` +
           `(${r.samples.length} samples, ${r.url})`,
         `  last notes: ${r.notes.slice(-5).map((n) => `${(n.t / 1000).toFixed(0)}s ${n.what}`).join(" | ") || "(none)"}`,
         `  ${["t(s)", ...keys].join("  ")}`,
