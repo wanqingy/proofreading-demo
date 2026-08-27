@@ -395,19 +395,15 @@ function renderBufferDepth(phase: "buffer" | "play") {
     return;
   }
   const pct = Math.round((d.aheadNm / d.targetNm) * 100);
-  const realPct = Math.round((d.realAheadNm / d.targetNm) * 100);
   const slowed = d.speedFraction < 0.95;
-  // Report the two numbers separately when they disagree. They disagree exactly when the path ahead
-  // includes chunks the server has already told us do not exist -- which render BLACK and which the
-  // old single `buffer %` counted as loaded, so it read 100% over blank EM. Since blank and
-  // unmyelinated look identical, that reading was a wrong-annotation hazard, not a cosmetic one.
-  const parts: string[] = [];
-  if (realPct < pct) parts.push(`buffer ${pct}% (only ${realPct}% has data)`);
-  else parts.push(`buffer ${pct}%`);
-  if (slowed) parts.push(`slowed to ${Math.round(d.speedFraction * 100)}%`);
-  if (!d.precise) parts.push("approx");
-  el.textContent = parts.join(" -- ");
-  el.className = slowed || realPct < pct ? "warn" : "";
+  // Deliberately just the one number. The "how much of that actually has image" figure lives in
+  // `getBufferDepth().realAheadNm` and in `flyCache()` for when it's wanted, but it is not shown
+  // here -- the zoom warning below is the signal that matters for tagging, and two competing
+  // percentages on the same row made the HUD harder to read rather than more informative.
+  el.textContent = slowed
+    ? `buffer ${pct}% -- slowed to ${Math.round(d.speedFraction * 100)}%${d.precise ? "" : " (approx)"}`
+    : `buffer ${pct}%`;
+  el.className = slowed ? "warn" : "";
 }
 
 // Zoomed past the cached strip: the periphery of the panel is black because no EM was ever
