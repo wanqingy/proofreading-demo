@@ -41,6 +41,8 @@ export interface Camera {
 
 export interface FlyKernelOptions {
   api: string;
+  // May be empty at construction: the page can start with no cell open (nothing reviewed yet, or
+  // resolving which cell was last worked on takes a fetch). Set it later with setRootId.
   rootId: string;
   onStatus?: (msg: string, cls?: string) => void;
   onProgress?: (frac: number, phase: "buffer" | "play") => void;
@@ -140,6 +142,9 @@ export interface FlyKernel {
   /** Summary of the previous session if it died without a clean exit (blank page / renderer
    * kill), else null. Read at startup -- the evidence is in localStorage, not the console. */
   getCrashReport(): string | null;
+  /** Point the kernel at a (different) cell. Needed because the kernel is constructed before the
+   * page knows which cell to open -- see FlyKernelOptions.rootId. */
+  setRootId(id: string): void;
   /** What is actually on screen right now: chunks in the 2D panel's footprint classified into real
    * (has image), absent (404 -- black forever) and pending (still coming). `pastStrip` is true once
    * a meaningful share of the view is absent, i.e. black for want of DATA rather than of time. */
@@ -179,6 +184,7 @@ export function createFlyKernel(opts: FlyKernelOptions): FlyKernel {
   let last = performance.now();
   let frames = 0;
   let annRankNotified = false;
+  let rootId = opts.rootId;
 
   const setPosition = (vox: [number, number, number]) => {
     try {
@@ -767,7 +773,7 @@ export function createFlyKernel(opts: FlyKernelOptions): FlyKernel {
     bufferToken++; // stop any current buffering immediately
     phase = "buffer";
     status(`branch ${pid}: fetching camera path (building tube if first visit)...`);
-    const url = new URL(`${opts.api}/api/cells/${opts.rootId}/branches/${pid}/camera`);
+    const url = new URL(`${opts.api}/api/cells/${rootId}/branches/${pid}/camera`);
     if (opts.compartment) url.searchParams.set("compartment", opts.compartment);
     const r = await fetch(url.toString());
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -813,6 +819,9 @@ export function createFlyKernel(opts: FlyKernelOptions): FlyKernel {
       }
     },
     loadBranch,
+    setRootId: (id: string) => {
+      rootId = id;
+    },
     getBufferDepth: () => depth,
     getCrashReport: () => crash.report(),
     getViewInfo: viewInfo,

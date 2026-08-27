@@ -103,16 +103,68 @@ class WAL:
         self._fh = open(self.path, "a", encoding="utf-8")
 
     @classmethod
-    def for_cell(cls, directory, datastack: str, seed_supervoxel: int, kind: str = "review") -> "WAL":
-        """Open a log for a cell, named by its durable seed supervoxel.
+    def for_cell(
+        cls,
+        directory,
+        datastack: str,
+        seed_supervoxel: int,
+        kind: str = "review",
+        root_id: Optional[int] = None,
+    ) -> "WAL":
+        """Open a cell's log, named by BOTH its segment id and its durable seed supervoxel.
 
         ``kind`` selects which independent event stream for this cell: "review" (default,
-        no suffix -- preserves existing filenames) is the merge/split/extend/question tag
-        workflow; "myelin" is the toggle-track tool. Same cell, same directory, separate files.
+        no suffix) is the merge/split/extend/question tag workflow; "myelin" is the myelination
+        tool. Same cell, same directory, separate files.
+
+        Naming carries both ids for different reasons, and the distinction is load-bearing:
+
+        * the **segment (root) id** is in the name so a human can tell at a glance which cell a
+          log belongs to -- a bare supervoxel id is unrecognisable, and a visits-only log records
+          the root id nowhere inside either.
+        * the **seed supervoxel** is the durable identity, and is therefore what LOOKUP keys on.
+          Root ids change whenever anyone edits the segmentation (see
+          ``CellReviewService.resolve``, which re-derives the root FROM the seed for exactly this
+          reason). Keying the lookup on the segment id would mean that the first session after
+          someone else's edit silently opens a NEW empty log and orphans every existing tag.
+
+        So: find by seed, name by both, and rename in place when the root id has moved. Renaming
+        an already-open file is safe on POSIX (handles follow the inode). Nothing is ever deleted,
+        merged or overwritten here -- if the destination somehow already exists we use it and leave
+        the other file untouched rather than guess which is authoritative.
         """
         suffix = "" if kind == "review" else f"__{kind}"
-        fname = f"{datastack}__seed{seed_supervoxel}{suffix}.jsonl"
-        return cls(Path(directory) / fname)
+        d = Path(directory)
+        seed = int(seed_supervoxel)
+        if root_id is None:
+            # No root id available: keep the historical name. Still found later by the seed glob.
+            return cls(d / f"{datastack}__seed{seed}{suffix}.jsonl")
+
+        desired = d / f"{datastack}__seg{int(root_id)}__seed{seed}{suffix}.jsonl"
+        if desired.exists():
+            return cls(desired)
+
+        # Find this cell's existing log by SEED, whatever segment id its name currently carries,
+        # including the pre-seg-id legacy name.
+        found = [p for p in sorted(d.glob(f"{datastack}__seg*__seed{seed}{suffix}.jsonl"))]
+        legacy = d / f"{datastack}__seed{seed}{suffix}.jsonl"
+        if legacy.exists():
+            found.append(legacy)
+
+        if len(found) > 1:
+            # Shouldn't happen. Adopt the largest (most history) and leave the rest alone, loudly.
+            found.sort(key=lambda p: p.stat().st_size, reverse=True)
+            print(
+                f"[wal] WARNING: {len(found)} logs for seed {seed}: "
+                f"{[p.name for p in found]}; using {found[0].name} and leaving the others untouched"
+            )
+        if found:
+            try:
+                found[0].rename(desired)
+            except OSError as e:  # cross-device, permissions, race -- keep using the old name
+                print(f"[wal] could not rename {found[0].name} -> {desired.name} ({e}); using as-is")
+                return cls(found[0])
+        return cls(desired)
 
     # ----- writing (each call is durable) -------------------------------- #
     def _write(self, obj: dict) -> None:
@@ -163,8 +215,14 @@ class WAL:
     def set_root(self, xyz_nm) -> None:
         self._write({"event": "set_root", "xyz_nm": [float(c) for c in xyz_nm]})
 
-    def mark_myelin_visited(self, l2_ids) -> None:
-        self._write({"event": "myelin_visit", "l2_ids": [int(x) for x in l2_ids]})
+    def mark_myelin_visited(self, l2_ids, root_id: Optional[int] = None) -> None:
+        # root_id is recorded so a visits-only log is still self-describing. `myelin_tag` events
+        # already carry it, but a cell reviewed without any myelinated node produces visits only,
+        # and such a file used to identify its cell nowhere at all.
+        ev = {"event": "myelin_visit", "l2_ids": [int(x) for x in l2_ids]}
+        if root_id is not None:
+            ev["root_id"] = int(root_id)
+        self._write(ev)
 
     def tag_myelinated(
         self,

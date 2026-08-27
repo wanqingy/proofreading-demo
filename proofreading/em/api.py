@@ -32,6 +32,9 @@ Endpoints (M1):
     GET    /api/warm-queue                            -- queue status (+ live fill of the cell
                                                           being built now)
     DELETE /api/warm-queue/{root_id}                  -- drop a cell from the queue
+    GET  /api/sessions                                -- cells with a log here, most recently
+                                                          worked on first (?kind=myelin|review);
+                                                          lets the UI reopen the last cell
     POST /api/crash-report                            -- append a renderer-kill breadcrumb to
                                                           <wal_dir>/crash_reports/<tool>.log
     GET  /healthz
@@ -42,6 +45,7 @@ Run via :mod:`proofreading.em.serve`. Single-user, bind to localhost only.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import threading
@@ -110,6 +114,36 @@ class CrashReportRequest(BaseModel):
 _CRASH_TOOL_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
 _CRASH_REPORT_MAX_BYTES = 64_000  # one breadcrumb report; a bad client can't force a huge write
 _CRASH_LOG_MAX_BYTES = 1_000_000  # per-tool log cap -- a crash LOOP must not be able to fill disk
+
+# A cell's log is named `<datastack>__seg<root>__seed<supervoxel>[__myelin].jsonl`; the `seg` part is
+# absent on logs written before it was added. See WAL.for_cell for why lookup keys on the seed.
+_LOG_NAME_RE = re.compile(
+    r"^(?P<ds>.+?)__(?:seg(?P<seg>\d+)__)?seed(?P<seed>\d+)(?P<sfx>__myelin)?\.jsonl$"
+)
+
+# A legacy log carries its root id only inside its events. Scan a bounded prefix: enough to find the
+# first event that has one, cheap enough to do while listing every session, and a log with none is
+# reported unidentified rather than searched harder.
+_ROOT_SCAN_MAX_LINES = 200
+
+
+def _root_id_from_log(path: str) -> Optional[str]:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for i, line in enumerate(fh):
+                if i >= _ROOT_SCAN_MAX_LINES:
+                    break
+                if '"root_id"' not in line:
+                    continue
+                try:
+                    rid = json.loads(line).get("root_id")
+                except (ValueError, TypeError):
+                    continue
+                if rid:
+                    return str(rid)
+    except OSError:
+        pass
+    return None
 
 
 def create_app(
@@ -294,6 +328,59 @@ def create_app(
     @app.get("/api/cells/{root_id}/myelin/tags")
     def myelin_tags(root_id: int, path_id: Optional[int] = None):
         return get_session(root_id).myelin_tags(path_id)
+
+    @app.get("/api/sessions")
+    def list_sessions(kind: str = "myelin", limit: int = 50):
+        """Cells that already have a log here, most recently worked on first.
+
+        This is what lets the UI reopen the cell you were last on instead of a hardcoded default,
+        and show an empty viewer when there is no history at all. The logs on disk are the source
+        of truth rather than browser storage, so it survives switching browser or machine.
+
+        Reads only the filename and mtime for the common case. A pre-seg-id legacy log has no root
+        id in its name, so for those (only) we scan the file for the first event carrying one --
+        bounded, because a log with no root id anywhere is simply reported as unidentified rather
+        than worth an expensive search.
+        """
+        want = "__myelin" if kind == "myelin" else ""
+        out = []
+        try:
+            entries = os.listdir(wal_dir)
+        except OSError:
+            return {"sessions": []}
+        for name in entries:
+            m = _LOG_NAME_RE.match(name)
+            if not m or (m.group("sfx") or "") != want:
+                continue
+            path = os.path.join(wal_dir, name)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            root = m.group("seg")
+            if root is None:
+                root = _root_id_from_log(path)
+            if root is None:
+                # Last resort, no network needed: the OTHER tool's log for the same cell. Both are
+                # keyed on the same seed, and review events have always recorded root_id -- so a
+                # myelin log that is all visits (which carried no root id until recently) can still
+                # be identified from its sibling. Only helps where that sibling has content.
+                sib = m.group("sfx") and name.replace("__myelin.jsonl", ".jsonl")
+                if not sib:
+                    sib = name.replace(".jsonl", "__myelin.jsonl")
+                if sib != name:
+                    root = _root_id_from_log(os.path.join(wal_dir, sib))
+            out.append({
+                "root_id": root,                      # string or None if unidentifiable
+                "seed": m.group("seed"),
+                "datastack": m.group("ds"),
+                "file": name,
+                "bytes": st.st_size,
+                "modified": datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat(),
+                "mtime": st.st_mtime,
+            })
+        out.sort(key=lambda r: r["mtime"], reverse=True)
+        return {"sessions": out[: max(1, int(limit))]}
 
     @app.post("/api/crash-report")
     def crash_report(req: CrashReportRequest):

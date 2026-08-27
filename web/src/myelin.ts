@@ -52,9 +52,13 @@ let live: LiveSources | null = null;
 
 const params = new URLSearchParams(location.search);
 const API = (params.get("api") || "http://localhost:8000").replace(/\/$/, "");
-// default has confirmed axon branches (57) -- 864691135413357554, the prior default, has none,
-// which made an un-parameterized first open look broken (empty branch picker, nothing to fly).
-const ROOT_ID = params.get("root") || "864691136335553971";
+// Which cell to open, resolved in main(): an explicit ?root= wins, else the cell whose log was most
+// recently written (from GET /api/sessions -- the logs on disk are the source of truth, so this
+// survives switching browser or machine), else nothing at all and we show an empty viewer.
+//
+// Deliberately no hardcoded fallback cell: opening someone else's example cell on a fresh install
+// looks like the tool is broken, and opening it INSTEAD of the cell you were last on is worse.
+let ROOT_ID = params.get("root") || "";
 const DATASTACK = params.get("datastack") || "minnie65_public";
 
 const $ = (id: string) => document.getElementById(id)!;
@@ -709,6 +713,52 @@ async function main() {
     true,
   );
 
+  // No cell given: reopen whichever cell was last worked on, per the logs on disk.
+  let askedSessions = false; // did the lookup actually answer? "no history" vs "couldn't ask"
+  if (!ROOT_ID) {
+    status("looking up your last session...");
+    try {
+      const sr = await fetch(`${API}/api/sessions?kind=myelin`);
+      askedSessions = sr.ok;
+      if (sr.ok) {
+        const sessions = (await sr.json()).sessions as { root_id: string | null }[];
+        // Skip logs whose cell can't be identified. Those are pre-existing logs written before the
+        // segment id was recorded; opening a DIFFERENT, older cell instead would be worse than
+        // opening none, so they're skipped rather than substituted for.
+        ROOT_ID = sessions.find((s) => s.root_id)?.root_id ?? "";
+        const unidentified = sessions.filter((s) => !s.root_id).length;
+        if (unidentified) {
+          console.info(
+            `[myelin] ${unidentified} earlier log(s) don't record which cell they belong to, so ` +
+              `they can't be reopened automatically. Open the cell once by id and its log will be ` +
+              `renamed to include it.`,
+          );
+        }
+      }
+    } catch (e) {
+      console.warn("[myelin] couldn't list previous sessions", e);
+    }
+  }
+
+  if (!ROOT_ID) {
+    // Stay on an empty viewer rather than opening an arbitrary cell. The cell-id box above is live,
+    // so typing one is the way in.
+    cellInput.value = "";
+    cellInput.placeholder = "paste a cell (segment) id";
+    // Do not claim "no previous session" when we never got an answer -- an unreachable backend
+    // would otherwise look identical to a fresh install, sending you to look in the wrong place.
+    status(
+      askedSessions
+        ? "no previous session -- enter a cell id above to start"
+        : `can't reach the backend at ${API} -- start it with: ` +
+          `uv run python -m proofreading.em.serve`,
+      "warn",
+    );
+    return;
+  }
+  cellInput.value = ROOT_ID;
+  kernel.setRootId(ROOT_ID);
+
   status(`opening cell ${ROOT_ID}...`);
   try {
     const hr = await fetch(`${API}/api/cells`, {
@@ -718,10 +768,27 @@ async function main() {
       // branch, so later branches are already cached by the time the sweep reaches them.
       body: JSON.stringify({ root_id: ROOT_ID, datastack: DATASTACK, warm_compartment: "axon" }),
     });
-    if (!hr.ok) throw new Error(`HTTP ${hr.status}`);
+    if (!hr.ok) {
+      // Distinguish "the backend isn't running" from "the backend ran and something upstream
+      // failed" -- they have completely different fixes, and telling someone to start a server
+      // that is demonstrably already answering sends them the wrong way. A 5xx here is usually
+      // CAVE being unavailable (its materialize/skeleton services), which no local action fixes.
+      const detail = (await hr.text().catch(() => "")).slice(0, 300);
+      const upstream = /materialize|skeleton|daf-apis|microns|CAVE/i.test(detail);
+      throw new Error(
+        hr.status >= 500
+          ? `backend reached, but the request failed (HTTP ${hr.status})` +
+            (upstream ? " -- looks like the CAVE service is down; retry later" : "") +
+            (detail ? `. Server said: ${detail}` : "")
+          : `HTTP ${hr.status}${detail ? `: ${detail}` : ""}`,
+      );
+    }
   } catch (e) {
+    const unreachable = e instanceof TypeError; // fetch() rejects with TypeError when it can't connect
     status(
-      `couldn't open cell -- is the backend up? (uv run --extra em --extra serve python -m proofreading.em.serve)  ${e}`,
+      unreachable
+        ? `can't reach the backend at ${API} -- start it with: uv run python -m proofreading.em.serve`
+        : `couldn't open cell ${ROOT_ID}: ${e}`,
       "warn",
     );
     return;

@@ -73,13 +73,15 @@ class CellReviewService:
         emclient.agg_seg_cv(self.tube_mip)
 
         # durable state (resumes prior coverage if a log already exists)
-        self.wal = WAL.for_cell(wal_dir, self.datastack, self.seed)
+        self.wal = WAL.for_cell(wal_dir, self.datastack, self.seed, root_id=self.root_id)
         _state = WAL.load(self.wal.path)
         self.coverage = Coverage.from_wal_state(_state)
         # myelin events live in a SEPARATE file from the review tags above (different tool,
         # different vocabulary -- see wal.py's `for_cell` docstring), so myelin review progress
         # is resumed from its own log; no omission concept for this coverage dimension.
-        self.myelin_wal = WAL.for_cell(wal_dir, self.datastack, self.seed, kind="myelin")
+        self.myelin_wal = WAL.for_cell(
+            wal_dir, self.datastack, self.seed, kind="myelin", root_id=self.root_id
+        )
         _myelin_state = WAL.load(self.myelin_wal.path)
         self.myelin_coverage = Coverage(visited_l2=set(_myelin_state.myelin_visited_l2))
         self._resume_root_xyz = _state.root_xyz  # re-applied at the end of __init__ (below)
@@ -703,7 +705,7 @@ class CellReviewService:
         pid = int(path_id)
         bp = self.tree.branch_paths[pid]
         l2 = self.tree.l2_ids_for_vertices(bp.vertices)
-        self.myelin_wal.mark_myelin_visited(l2)
+        self.myelin_wal.mark_myelin_visited(l2, root_id=self.root_id)
         self.myelin_coverage.mark_visited(l2)
         todo = set(self.myelin_coverage.to_review(self.tree))
         axon_metas = [self.branch_metadata(i) for i in self._branch_order()]
