@@ -58,9 +58,10 @@ Only a narrow strip of image is downloaded around the axon — roughly ±1.2 µm
 default and the view quickly extends beyond it, and those areas are **black because there is no
 image there**, not because it is still loading. Waiting will never fill them.
 
-The HUD says so explicitly when it happens, e.g. `36% of the centre of this view has NO image`. That
-warning matters for tagging: black and unmyelinated look identical on screen, so treat any black
-region as "no data", never as "unmyelinated".
+This matters for tagging, because black and unmyelinated look identical on screen: **treat black as
+"no data", never as "unmyelinated"**. The HUD deliberately stays quiet about it — run `flyCache()` in
+the devtools console when you want the number, and it prints the current zoom, how far the view
+reaches, and how much of the centre has no image.
 
 Measured, so you know what to expect (fraction of the middle of the view with no image):
 

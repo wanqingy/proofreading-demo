@@ -406,33 +406,14 @@ function renderBufferDepth(phase: "buffer" | "play") {
   el.className = slowed ? "warn" : "";
 }
 
-// Zoomed past the cached strip: the periphery of the panel is black because no EM was ever
-// downloaded there, not because it is still loading. Waiting will never fill it.
-//
-// This is the signal that actually prevents a wrong annotation, because black and unmyelinated look
-// the same on screen -- so it says plainly that the outside of the view is not reviewable, rather
-// than leaving the buffer percentage to imply everything is fine.
-function renderZoomWarning() {
-  const el = $("zoomwarn");
-  try {
-    const v = kernel.getViewInfo();
-    if (!v.nmPerPx || !v.pastStrip) {
-      el.textContent = "";
-      return;
-    }
-    el.textContent =
-      `${Math.round(v.holeFrac * 100)}% of the centre of this view has NO image (zoomed out past ` +
-      `the cached strip) -- black here is missing data, not unmyelinated axon`;
-  } catch {
-    el.textContent = "";
-  }
-}
+// No on-screen warning about zooming past the cached strip: the HUD stays quiet. The measurement
+// itself is still available on demand -- `flyCache()` prints the zoom, the view's half-width and
+// how much of the centre has no image, and `__fly.getViewInfo()` returns the same numbers.
 
 function onProgress(frac: number, phase: "buffer" | "play") {
   $("progresspct").textContent = phase === "buffer" ? "buffering" : `${(frac * 100).toFixed(0)}%`;
   ($("progress") as HTMLInputElement).value = String(Math.round(frac * 1000));
   renderBufferDepth(phase);
-  renderZoomWarning();
   if (paintMode && phase === "play") {
     const pos = kernel.getCurrentPositionNm();
     const pid = kernel.getCurrentPid();
