@@ -110,6 +110,7 @@
       </div>
       <div class="row" style="margin-bottom: 6px; color: #9fb0d0; font-size: 11px">
         <span id="coverage">&mdash;</span>
+        <span id="celldonebadge" class="ok" style="display: none; font-weight: bold">CELL DONE</span>
       </div>
       <div class="row"><span>progress</span><span class="v" id="progresspct">0%</span></div>
       <div class="row" style="margin-bottom: 4px">
@@ -137,6 +138,7 @@
       <div class="controls">
         <button id="toggle">pause cam</button>
         <button id="markdone">branch done (x)</button>
+        <button id="celldone">cell done</button>
         <label>speed <input type="range" id="speed" min="200" max="6000" step="100" value="1000" /></label>
       </div>
       <div id="legend" style="margin-top: 6px; color: #7f8db0; font-size: 11px">
@@ -146,6 +148,8 @@
         <b style="color: #ff5566">d</b> delete nearest tag<br />
         <b style="color: #ff8a8a">p</b> start/stop painting -- auto-tags every node the camera
         passes while flying, so you don't need <b>t</b> per node<br />
+        <b>cell done</b> button: the whole cell is finished -- the next time you open this tool
+        with no id given, it starts empty instead of reopening this one. Click again to undo<br />
         <b style="color: #33ff99">green</b> dots: myelinated tags (also browsable/deletable in
         neuroglancer's own Annotations panel)<br />
         whole cell: <b style="color: #cc66ff">magenta</b> branch points &middot;

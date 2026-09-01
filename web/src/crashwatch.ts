@@ -30,10 +30,18 @@ export interface CrashRecord {
    * it is reported separately rather than being invisible. */
   maxStallMs: number;
   maxStallAt: number;
+  /** Longest gap that was NOT the page's fault -- see `unrunnable` below. Kept because it explains
+   * a hole in the samples, but never reported as a freeze. */
+  maxSuspendMs?: number;
 }
 
 /** A freeze worth telling the user about. Below this it's ordinary GC / tab throttling noise. */
 const STALL_REPORT_MS = 3000;
+
+/** Beyond this, a gap is the machine sleeping rather than the page blocking. Chrome throttles a
+ * hidden tab's timers to one per MINUTE after 5 minutes hidden, and a closed lid stops them
+ * outright; neither is a fault, and calling them one trains you to ignore the message. */
+const MAX_CREDIBLE_STALL_MS = 120_000;
 
 export interface PreviousSession {
   crashed: boolean; // had samples but never recorded a clean exit
@@ -60,6 +68,7 @@ function readPrevious(): PreviousSession | null {
     if (!record?.samples?.length) return null;
     record.maxStallMs ??= 0; // records written before stall tracking existed
     record.maxStallAt ??= 0;
+    record.maxSuspendMs ??= 0;
     return {
       crashed: !record.cleanExit,
       froze: record.maxStallMs >= STALL_REPORT_MS,
@@ -96,9 +105,26 @@ export function startCrashWatch(opts: {
     notes: [],
     maxStallMs: 0,
     maxStallAt: 0,
+    maxSuspendMs: 0,
   };
   const t0 = performance.now();
   let dirty = false;
+
+  // A late heartbeat only means the MAIN THREAD was blocked if the tab was runnable throughout.
+  // Hidden tabs are throttled (to 1/minute after 5 min hidden), Chrome freezes background tabs
+  // outright, and a sleeping machine stops them entirely -- measured: a tab frozen 6.5s and then
+  // closed normally used to report "previous session FROZE for 6.5s". So watch for the tab being
+  // unrunnable at any point between two ticks and don't blame the page for that gap.
+  let sawUnrunnable = false;
+  const markUnrunnable = () => {
+    sawUnrunnable = true;
+  };
+  const onVisibility = () => {
+    if (document.visibilityState !== "visible") sawUnrunnable = true;
+  };
+  document.addEventListener("visibilitychange", onVisibility);
+  window.addEventListener("freeze", markUnrunnable); // Chrome tab-freezing lifecycle
+  window.addEventListener("resume", markUnrunnable);
 
   const flush = () => {
     if (!dirty) return;
@@ -126,15 +152,22 @@ export function startCrashWatch(opts: {
     // crash -- observed for real here: the page stopped answering for 8s+ while zoomed far out and
     // flying, then navigated away normally and reported nothing.
     const now = performance.now();
-    const stallMs = Math.max(0, Math.round(now - lastTickAt - interval));
+    const gapMs = Math.max(0, Math.round(now - lastTickAt - interval));
     lastTickAt = now;
+    // Blame the page only for a gap it could have caused: tab visible and runnable the whole way
+    // through, and short enough to be JS rather than a suspended machine.
+    const ourFault =
+      !sawUnrunnable && document.visibilityState === "visible" && gapMs < MAX_CREDIBLE_STALL_MS;
+    sawUnrunnable = false;
+    const stallMs = ourFault ? gapMs : 0;
     if (stallMs > record.maxStallMs) {
       record.maxStallMs = stallMs;
       record.maxStallAt = Math.round(now - t0);
     }
+    if (!ourFault && gapMs > record.maxSuspendMs!) record.maxSuspendMs = gapMs;
     record.samples.push({
       t: Math.round(now - t0),
-      ...(stallMs > interval ? { stallMs } : {}),
+      ...(gapMs > interval ? (ourFault ? { stallMs } : { suspendMs: gapMs }) : {}),
       ...heapFields(),
       ...stats,
     });
@@ -167,6 +200,9 @@ export function startCrashWatch(opts: {
       window.clearInterval(timer);
       window.removeEventListener("pagehide", onExit);
       window.removeEventListener("beforeunload", onExit);
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("freeze", markUnrunnable);
+      window.removeEventListener("resume", markUnrunnable);
     },
     previous: () => previous,
     report() {
@@ -178,8 +214,14 @@ export function startCrashWatch(opts: {
       const { record: r, ageMs } = previous;
       const tail = r.samples.slice(-12);
       const keys = Object.keys(tail[tail.length - 1] ?? {}).filter((k) => k !== "t");
+      // Two causes produce "no clean exit" and they are NOT distinguishable from inside the page:
+      // the renderer was killed, OR the main thread was still blocked when the tab/window closed,
+      // so `pagehide` never got to run (measured: close a wedged page and it looks like a kill).
+      // Say both, then let the numbers below discriminate -- heap at the ceiling means a kill,
+      // stalls in the tail mean it was already wedged.
       const headline = previous.crashed
-        ? `previous session ended WITHOUT a clean exit (renderer killed)`
+        ? `previous session ended WITHOUT a clean exit -- either the renderer was killed, or the ` +
+          `page was still blocked when you closed it (a blocked page cannot run its exit handler)`
         : `previous session FROZE: main thread blocked for ${(r.maxStallMs / 1000).toFixed(1)}s ` +
           `at t+${(r.maxStallAt / 1000).toFixed(0)}s (it exited cleanly afterwards)`;
       const lines = [
@@ -190,6 +232,13 @@ export function startCrashWatch(opts: {
       ];
       for (const s of tail) {
         lines.push(`  ${[(s.t / 1000).toFixed(0), ...keys.map((k) => String(s[k] ?? ""))].join("  ")}`);
+      }
+      if (r.maxSuspendMs) {
+        // Not a fault, but it explains a hole in the sample timeline -- say so, so the hole isn't
+        // read as evidence of one.
+        lines.push(
+          `  (also paused ${(r.maxSuspendMs / 1000).toFixed(0)}s while hidden/asleep -- not a freeze)`,
+        );
       }
       const first = r.samples[0];
       const last = r.samples[r.samples.length - 1];

@@ -84,6 +84,8 @@ class CellReviewService:
         )
         _myelin_state = WAL.load(self.myelin_wal.path)
         self.myelin_coverage = Coverage(visited_l2=set(_myelin_state.myelin_visited_l2))
+        self.myelin_done = _myelin_state.cell_done
+        self.myelin_done_ts = _myelin_state.cell_done_ts
         self._resume_root_xyz = _state.root_xyz  # re-applied at the end of __init__ (below)
 
         self.tube_cache_dir = os.path.join(
@@ -281,6 +283,8 @@ class CellReviewService:
             "branches": metas,
             "summary": self.coverage.summary(self.tree),
             "myelin_summary": self._tally_myelin_state(axon_metas),
+            "myelin_done": self.myelin_done,
+            "myelin_done_ts": self.myelin_done_ts,
         }
 
     # ------------------------------------------------------------------ #
@@ -571,6 +575,26 @@ class CellReviewService:
         """Remove a myelin tag, reverting that node to the unmyelinated default."""
         self.myelin_wal.delete_myelin_tag(uuid)
         return {"uuid": uuid}
+
+    def set_myelin_cell_done(self, done: bool) -> dict:
+        """Declare (or un-declare) the whole cell finished for myelin tagging. Independent of any
+        branch's own `built`/coverage state -- it's the signal the reopen-last-cell flow checks
+        so a finished cell isn't handed back to you again on the next launch."""
+        self.myelin_wal.set_cell_done(done)
+        # Re-read rather than stamp our own clock: the WAL's `_now()` (inside `_write`) is the one
+        # source of truth for `ts`, and every other read of this state already goes through
+        # `WAL.load` (see `myelin_tags` above) rather than duplicating timestamp formatting here.
+        _state = WAL.load(self.myelin_wal.path)
+        self.myelin_done = _state.cell_done
+        self.myelin_done_ts = _state.cell_done_ts
+        return {
+            "myelin_done": self.myelin_done,
+            "myelin_done_ts": self.myelin_done_ts,
+            "myelin_summary": self._tally_myelin_state(
+                [m for m in (self.branch_metadata(i) for i in self._branch_order())
+                 if m["compartment"] == "axon"]
+            ),
+        }
 
     def myelin_tags(self, path_id: int | None = None) -> dict:
         """Live myelin tags, optionally restricted to one branch (for refreshing just that

@@ -31,6 +31,10 @@ Events
   coverage): a branch marked done in the myelin tool has only been checked for myelination,
   not for proofreading errors, so conflating the two would make one tool's progress lie about
   the other's.
+- ``cell_done`` -- the whole cell declared finished (``done: bool``), independent of any
+  particular branch's state. Reversible like ``ann_status``: last write wins. Written to the
+  myelin stream only, by the myelin tool's "cell done" action -- it says nothing about the
+  review pass, same separation as ``myelin_visit`` vs ``visit`` above.
 
 One log per cell **per event vocabulary**, named by the **seed supervoxel** (the durable
 identity) so a later session over a new root id appends to and resumes the same log(s). The
@@ -92,6 +96,8 @@ class WalState:
     root_xyz: Optional[List[float]] = None  # last chosen review root (nm); None = skeleton default
     myelin_visited_l2: Set[int] = field(default_factory=set)  # separate from visited_l2 -- see wal docstring
     myelin_tags: Dict[str, MyelinTag] = field(default_factory=dict)  # live (un-tombstoned), uuid-keyed
+    cell_done: bool = False  # this whole cell declared finished (last cell_done event wins)
+    cell_done_ts: Optional[str] = None
 
 
 class WAL:
@@ -247,6 +253,11 @@ class WAL:
     def delete_myelin_tag(self, uuid: str) -> None:
         self._write({"event": "myelin_tag_tombstone", "uuid": uuid})
 
+    def set_cell_done(self, done: bool) -> None:
+        # Reversible, like set_annotation_done -- a misclick costs one more click, not a corrupted
+        # log. Written to whichever stream this WAL instance is (myelin, in the one caller today).
+        self._write({"event": "cell_done", "done": bool(done)})
+
     def close(self) -> None:
         self._fh.close()
 
@@ -306,6 +317,9 @@ class WAL:
                     )
                 elif kind == "myelin_tag_tombstone":
                     myelin_tag_tombstoned.add(ev["uuid"])
+                elif kind == "cell_done":
+                    state.cell_done = bool(ev.get("done"))  # last event wins -- file order
+                    state.cell_done_ts = ev.get("ts")
         # apply tombstones: drop annotations and reverse any omissions they caused
         for u in tombstoned:
             state.annotations.pop(u, None)

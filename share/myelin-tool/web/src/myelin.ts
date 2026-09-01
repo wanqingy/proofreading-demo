@@ -476,11 +476,13 @@ const crashReport = kernel.getCrashReport();
 if (crashReport) {
   console.warn(`[myelin] previous session ended badly:\n${crashReport}`);
   const notice = $("crashnotice");
-  // "crashed or froze": a killed renderer and a renderer wedged for many seconds are different
-  // faults with different fixes, and the report itself says which -- but from the user's seat both
-  // just mean "the last session broke", so the one-liner covers both.
+  // A killed renderer and a renderer wedged for many seconds are different faults with different
+  // fixes, and the report itself says which -- but from the user's seat both just mean "the last
+  // session broke", so the one-liner covers both. It also says the tags are fine, because this
+  // notice otherwise reads as "you lost work": every tag is fsync'd to the log as it's placed.
   notice.textContent =
-    "previous session crashed or froze -- see console (also written to the backend log)";
+    "previous session ended badly -- your tags are all saved; details in the console " +
+    "(and in the backend log)";
   notice.style.display = "";
   fetch(`${API}/api/crash-report`, {
     method: "POST",
@@ -524,7 +526,13 @@ async function markDone() {
     renderMyelinSummary(resp.myelin_summary, resp.branches);
     const next = resp.next_path_id;
     if (next === null || next === undefined) {
-      status(`branch ${pid} done -- all axon branches reviewed`, "ok");
+      status(
+        myelinDone
+          ? `branch ${pid} done -- all axon branches reviewed`
+          : `branch ${pid} done -- all axon branches reviewed. click "cell done" if you're ` +
+            `finished with this cell`,
+        "ok",
+      );
     } else {
       status(`branch ${pid} done -- advancing to #${next}`, "ok");
       await loadBranchAndRefresh(next);
@@ -562,6 +570,44 @@ function renderMyelinSummary(summary?: Record<string, number>, branches?: Branch
 // background warm-up progress (how many axon branches already have their tube built)
 let builtCount = 0;
 let branchCount = 0;
+
+// Whole-cell "finished" flag (independent of any branch's own state) -- see the `cell done`
+// button below and wal.py's `cell_done` event docstring for why this exists: without it, the
+// reopen-last-cell flow would hand you back a cell you already declared done, forever.
+let myelinDone = false;
+
+function setCellDoneUI(done: boolean, ts?: string | null) {
+  myelinDone = done;
+  const btn = $("celldone") as HTMLButtonElement;
+  btn.textContent = done ? "undo cell done" : "cell done";
+  const badge = $("celldonebadge") as HTMLElement;
+  badge.style.display = done ? "" : "none";
+  badge.title = done && ts ? `marked done at ${ts}` : "";
+}
+
+async function toggleCellDone() {
+  const next = !myelinDone;
+  status(next ? `marking cell ${ROOT_ID} done...` : "clearing done mark...");
+  try {
+    const r = await fetch(`${API}/api/cells/${ROOT_ID}/myelin/done`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ done: next }),
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const resp = await r.json();
+    setCellDoneUI(resp.myelin_done, resp.myelin_done_ts);
+    renderMyelinSummary(resp.myelin_summary);
+    status(
+      next
+        ? `cell ${ROOT_ID} marked done -- the next open will start empty`
+        : "done mark cleared",
+      "ok",
+    );
+  } catch (e) {
+    status(`cell-done update failed: ${e}`, "warn");
+  }
+}
 
 // A read that hasn't advanced a chunk in this long is almost certainly wedged rather than slow
 // (chunks normally land every few hundred ms), so surface it instead of spinning silently.
@@ -665,6 +711,10 @@ async function main() {
     updatePlayButton();
   };
   ($("markdone") as HTMLButtonElement).onclick = () => markDone();
+  // No keybinding for this one, deliberately: t/x/d/p are all single-keystroke, and a stray key
+  // marking the WHOLE CELL done is a worse accident than the convenience is worth. It's a toggle
+  // rather than a confirm dialog for the same reason -- undo is one click either way.
+  ($("celldone") as HTMLButtonElement).onclick = () => toggleCellDone();
   ($("speed") as HTMLInputElement).oninput = (e) =>
     kernel.setSpeed(parseFloat((e.target as HTMLInputElement).value));
 
@@ -713,19 +763,29 @@ async function main() {
     true,
   );
 
-  // No cell given: reopen whichever cell was last worked on, per the logs on disk.
+  // No cell given: reopen whichever cell was last worked on, per the logs on disk -- unless it was
+  // marked done, in which case reopening it would defeat the point of marking it done.
   let askedSessions = false; // did the lookup actually answer? "no history" vs "couldn't ask"
+  let lastWasDone: { root_id: string } | null = null; // set only if the skip-because-done path fires
   if (!ROOT_ID) {
     status("looking up your last session...");
     try {
       const sr = await fetch(`${API}/api/sessions?kind=myelin`);
       askedSessions = sr.ok;
       if (sr.ok) {
-        const sessions = (await sr.json()).sessions as { root_id: string | null }[];
+        const sessions = (await sr.json()).sessions as
+          { root_id: string | null; done?: boolean }[];
         // Skip logs whose cell can't be identified. Those are pre-existing logs written before the
         // segment id was recorded; opening a DIFFERENT, older cell instead would be worse than
         // opening none, so they're skipped rather than substituted for.
-        ROOT_ID = sessions.find((s) => s.root_id)?.root_id ?? "";
+        const latest = sessions.find((s) => s.root_id);
+        if (latest?.done) {
+          // Deliberately does NOT fall through to an older, undone session -- "done" means you're
+          // finished for now, not "skip to whatever's next"; typing a cell id is the way back in.
+          lastWasDone = { root_id: latest.root_id! };
+        } else {
+          ROOT_ID = latest?.root_id ?? "";
+        }
         const unidentified = sessions.filter((s) => !s.root_id).length;
         if (unidentified) {
           console.info(
@@ -748,10 +808,12 @@ async function main() {
     // Do not claim "no previous session" when we never got an answer -- an unreachable backend
     // would otherwise look identical to a fresh install, sending you to look in the wrong place.
     status(
-      askedSessions
-        ? "no previous session -- enter a cell id above to start"
-        : `can't reach the backend at ${API} -- start it with: ` +
-          `uv run python -m proofreading.em.serve`,
+      lastWasDone
+        ? `last cell ${lastWasDone.root_id} is marked done -- enter a cell id above to start`
+        : askedSessions
+          ? "no previous session -- enter a cell id above to start"
+          : `can't reach the backend at ${API} -- start it with: ` +
+            `uv run python -m proofreading.em.serve`,
       "warn",
     );
     return;
@@ -811,6 +873,7 @@ async function main() {
     const data = await br.json();
     branches = data.branches;
     renderMyelinSummary(data.myelin_summary || {}, branches);
+    setCellDoneUI(!!data.myelin_done, data.myelin_done_ts);
   } catch (e) {
     status(`couldn't list axon branches: ${e}`, "warn");
     return;

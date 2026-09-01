@@ -17,8 +17,13 @@ uv run python -m proofreading.em.serve
 ```
 
 Open **http://localhost:8000** in a browser. That's it — one process, no Node, no notebook.
-It opens cell `864691136335553971` by default (57 axon branches); pass a different one with
-`?root=<id>`, e.g. `http://localhost:8000/?root=864691135572530981`.
+
+It reopens **whichever cell you last worked on** — the one whose log was written most recently and
+isn't marked **cell done** (see below), so switching browser or machine doesn't lose your place.
+The first time, or once every cell you've touched is marked done, the viewer starts empty and waits
+for you to type a cell id (`864691136335553971` is a good one to start with — 57 axon branches).
+`?root=<id>` opens a specific cell regardless, e.g. `http://localhost:8000/?root=864691135572530981`
+— including one you've already marked done; the badge just tells you so.
 
 ## Using it
 
@@ -36,6 +41,15 @@ Green dots are myelinated tags — they're real Neuroglancer annotations, so the
 visible and deletable in Neuroglancer's own **Annotations** panel, not just through this UI.
 Magenta = branch points, white = tips, shown for the whole cell so you can see where the
 current branch sits in the larger arbor.
+
+**The "cell done" button** (next to `x`, no keybinding — a stray keystroke marking a whole cell
+finished would be a worse accident than the convenience is worth) is separate from marking
+individual branches reviewed: it's what the reopen-your-last-cell behaviour above checks, so a
+cell you've finished doesn't keep coming back. It's a toggle, not a one-way flag — click it again
+(it relabels itself **undo cell done**) to reverse it, and a **CELL DONE** badge next to the
+coverage line reminds you it's set while you're looking at that cell. Marking a cell done doesn't
+touch your tags or lock anything — you can keep tagging a done cell, its history is exactly as
+present as before, and closing it means the same thing it always did (see below).
 
 ### Why the camera sometimes slows down
 
@@ -78,6 +92,36 @@ Two things that will *not* help, both measured rather than guessed: raising the 
 downloads (the browser only opens 6 connections no matter what the setting says), and waiting longer
 (the missing tiles do not exist). Zooming back in is the only way to see image everywhere.
 
+### Stopping for the day
+
+**There is nothing to save, so close it however you like.** Every tag is appended and `fsync`'d to
+its log the instant you press the key — there is no "save" step and no in-memory buffer to lose, so
+closing the tab, quitting the browser, and `Ctrl-C`-ing the server are all safe at any moment, in
+any order. Closing the browser first is fine.
+
+If you've actually **finished** the cell, click **cell done** first (see above) — that's the one
+piece of state that closing the browser can't record for you, since it's a statement about the
+cell, not something derivable from when you stopped clicking.
+
+The one thing worth knowing: the next session tells you if the last one **ended badly**, and it
+decides that by whether the page got to run its exit handler. Measured, so you know what does and
+doesn't trip it:
+
+| how you ended it | reported next time? |
+|---|---|
+| close the tab, or the window, or quit the browser (`Cmd-Q`) | no — all three exit cleanly |
+| reload, or navigate away | no |
+| leave it open overnight / close the laptop lid / leave the tab in the background | no |
+| **close it while the page is unresponsive** | **yes** — see below |
+| the tab actually died (blank page) | yes |
+
+That fourth row is the one that surprises people. A page whose main thread is blocked **cannot run
+its exit handler**, so if you close a wedged tab to escape it, the next session can't tell that
+apart from the tab having been killed, and says so: *"ended without a clean exit — either the
+renderer was killed, or the page was still blocked when you closed it"*. If you'd rather not see
+that, wait for the page to respond again before closing it — but it is only a diagnostic. **Your
+tags are already on disk either way.**
+
 ### If the page goes blank or freezes
 
 A page that goes fully blank — HUD and all, since the HUD is ordinary HTML — means Chrome killed
@@ -103,6 +147,12 @@ would leave no trace, because the recorder is frozen along with everything else.
 measures how late each of its own samples was, and reports `previous session FROZE: main thread
 blocked for N s`. Zooming far out while the camera is flying is a known way to trigger this, which is
 another reason the tool now limits look-ahead loading when you zoom out.
+
+A late sample is only blamed on the page when the tab was **visible and runnable** the whole way
+through, because otherwise every laptop lid and every backgrounded tab would report a freeze that
+never happened: Chrome throttles a hidden tab's timers to one per *minute* after five minutes, and a
+sleeping machine stops them outright. Those gaps are still noted (`also paused Ns while
+hidden/asleep — not a freeze`) so a hole in the timeline isn't mistaken for evidence of one.
 
 Reading the report: heap climbing toward its limit points at a JS-side leak; a `webglcontextlost`
 note right before the end points at the GPU rather than the tab; a large `stallMs` points at the main
@@ -136,10 +186,14 @@ thread being overwhelmed rather than memory.
 ## Where your data goes
 
 Every tag you place or delete is appended to
-`proofread_sessions/<datastack>__seed<supervoxel>__myelin.jsonl` — one line per action, never
-rewritten in place. It's keyed by the cell's **seed supervoxel**, not its root id, so your
-progress survives the root id changing underneath you (segmentation edits elsewhere do this
-routinely). Re-running the tool against the same cell resumes exactly where you left off.
+`proofread_sessions/<datastack>__seg<root_id>__seed<supervoxel>__myelin.jsonl` — one line per
+action, `fsync`'d before the keystroke returns and never rewritten in place.
+
+The filename carries both ids, but the tool **finds** your log by the **seed supervoxel**, not by
+the root id, so your progress survives the root id changing underneath you (segmentation edits
+elsewhere do this routinely — and when it does, the file is renamed in place to carry the new
+`seg`, never replaced). Re-running the tool against the same cell resumes exactly where you left
+off. The root id is in the name purely so you can tell at a glance which cell a log is for.
 
 `proofread_sessions/tube_cache/` is the *other* thing that accumulates there — the downloaded
 EM/mask chunks. That's disposable; `clear_cache.py` above only ever touches that directory

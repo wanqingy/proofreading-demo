@@ -96,6 +96,10 @@ class MyelinTagRequest(BaseModel):
     path_id: Optional[int] = None
 
 
+class MyelinDoneRequest(BaseModel):
+    done: bool = True
+
+
 class WarmQueueRequest(BaseModel):
     root_ids: list[int]  # warmed one cell at a time, in this order
     datastack: Optional[str] = None
@@ -121,29 +125,45 @@ _LOG_NAME_RE = re.compile(
     r"^(?P<ds>.+?)__(?:seg(?P<seg>\d+)__)?seed(?P<seed>\d+)(?P<sfx>__myelin)?\.jsonl$"
 )
 
-# A legacy log carries its root id only inside its events. Scan a bounded prefix: enough to find the
-# first event that has one, cheap enough to do while listing every session, and a log with none is
-# reported unidentified rather than searched harder.
+# A legacy log carries its root id only inside its events, not its filename. Scan a bounded
+# prefix for it: enough to find the first event that has one, cheap enough to do while listing
+# every session, and a log with none is reported unidentified rather than searched harder.
 _ROOT_SCAN_MAX_LINES = 200
 
 
-def _root_id_from_log(path: str) -> Optional[str]:
+def _scan_log(path: str, need_root: bool) -> tuple[Optional[str], bool, Optional[str]]:
+    """One pass over a log, returning ``(root_id, cell_done, cell_done_ts)``.
+
+    ``root_id`` is only searched for (bounded, see above) when ``need_root`` -- i.e. the filename
+    itself didn't carry a ``seg`` id. ``cell_done`` is the LAST ``cell_done`` event in the file
+    (last write wins, same rule as replay in wal.py), so unlike the root-id search this can't stop
+    early and reads to EOF. Logs here are small (a session's worth of tags/visits), so a full read
+    is cheap; if that stops being true the fix is reading from the tail, not guessing.
+    """
+    root_id: Optional[str] = None
+    done = False
+    done_ts: Optional[str] = None
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             for i, line in enumerate(fh):
-                if i >= _ROOT_SCAN_MAX_LINES:
-                    break
-                if '"root_id"' not in line:
-                    continue
-                try:
-                    rid = json.loads(line).get("root_id")
-                except (ValueError, TypeError):
-                    continue
-                if rid:
-                    return str(rid)
+                if need_root and root_id is None and i < _ROOT_SCAN_MAX_LINES and '"root_id"' in line:
+                    try:
+                        rid = json.loads(line).get("root_id")
+                    except (ValueError, TypeError):
+                        rid = None
+                    if rid:
+                        root_id = str(rid)
+                if '"cell_done"' in line:
+                    try:
+                        ev = json.loads(line)
+                    except (ValueError, TypeError):
+                        continue
+                    if ev.get("event") == "cell_done":
+                        done = bool(ev.get("done"))
+                        done_ts = ev.get("ts")
     except OSError:
         pass
-    return None
+    return root_id, done, done_ts
 
 
 def create_app(
@@ -329,6 +349,10 @@ def create_app(
     def myelin_tags(root_id: int, path_id: Optional[int] = None):
         return get_session(root_id).myelin_tags(path_id)
 
+    @app.post("/api/cells/{root_id}/myelin/done")
+    def set_myelin_cell_done(root_id: int, req: MyelinDoneRequest):
+        return get_session(root_id).set_myelin_cell_done(req.done)
+
     @app.get("/api/sessions")
     def list_sessions(kind: str = "myelin", limit: int = 50):
         """Cells that already have a log here, most recently worked on first.
@@ -337,10 +361,12 @@ def create_app(
         and show an empty viewer when there is no history at all. The logs on disk are the source
         of truth rather than browser storage, so it survives switching browser or machine.
 
-        Reads only the filename and mtime for the common case. A pre-seg-id legacy log has no root
-        id in its name, so for those (only) we scan the file for the first event carrying one --
-        bounded, because a log with no root id anywhere is simply reported as unidentified rather
-        than worth an expensive search.
+        Every log is now opened once, because whether it was marked "cell done" lives only in the
+        file, never the filename. A pre-seg-id legacy log additionally has no root id in its name,
+        so for those we also scan for the first event carrying one -- bounded, because a log with
+        no root id anywhere is simply reported as unidentified rather than worth an expensive
+        search. Logs here are a session's worth of tags (0-100s of KB), so this is one small read
+        per session per page load, not a cost worth avoiding with an index.
         """
         want = "__myelin" if kind == "myelin" else ""
         out = []
@@ -358,18 +384,20 @@ def create_app(
             except OSError:
                 continue
             root = m.group("seg")
+            scanned_root, done, done_ts = _scan_log(path, need_root=root is None)
             if root is None:
-                root = _root_id_from_log(path)
+                root = scanned_root
             if root is None:
                 # Last resort, no network needed: the OTHER tool's log for the same cell. Both are
                 # keyed on the same seed, and review events have always recorded root_id -- so a
                 # myelin log that is all visits (which carried no root id until recently) can still
-                # be identified from its sibling. Only helps where that sibling has content.
+                # be identified from its sibling. Only helps where that sibling has content. The
+                # sibling's OWN `cell_done` (if any) is irrelevant here -- done-ness is per file.
                 sib = m.group("sfx") and name.replace("__myelin.jsonl", ".jsonl")
                 if not sib:
                     sib = name.replace(".jsonl", "__myelin.jsonl")
                 if sib != name:
-                    root = _root_id_from_log(os.path.join(wal_dir, sib))
+                    root, _, _ = _scan_log(os.path.join(wal_dir, sib), need_root=True)
             out.append({
                 "root_id": root,                      # string or None if unidentifiable
                 "seed": m.group("seed"),
@@ -378,6 +406,8 @@ def create_app(
                 "bytes": st.st_size,
                 "modified": datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat(),
                 "mtime": st.st_mtime,
+                "done": done,
+                "done_ts": done_ts,
             })
         out.sort(key=lambda r: r["mtime"], reverse=True)
         return {"sessions": out[: max(1, int(limit))]}
