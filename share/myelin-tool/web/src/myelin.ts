@@ -1,7 +1,8 @@
 // Axon myelination fly-through -- per-node tagging.
 //
-// Flies axon-compartment branches only (via `branches(compartment="axon")`) and lets the user
-// tag individual skeleton NODES as myelinated (key `t`, hover + press, same interaction shape
+// Flies axon-compartment branches by default (via `branches(compartment="axon")`), or the whole
+// skeleton when the cell's scope is "all" -- see SCOPE below and service.py's `_scope`. Lets the
+// user tag individual skeleton NODES as myelinated (key `t`, hover + press, same interaction shape
 // as main.ts's merge/split/extend/question point-tags -- see CONTEXT.md), defaulting to
 // unmyelinated (absence of a tag). This replaced an earlier continuous on/off toggle design:
 // a stray keypress could silently start a durable recording, and neither the toggle intervals
@@ -60,6 +61,15 @@ const API = (params.get("api") || "http://localhost:8000").replace(/\/$/, "");
 // looks like the tool is broken, and opening it INSTEAD of the cell you were last on is worse.
 let ROOT_ID = params.get("root") || "";
 const DATASTACK = params.get("datastack") || "minnie65_public";
+
+// Which part of the skeleton we're annotating: "axon" (default) or "all" (the whole skeleton,
+// including dendrite/soma/unclassified branches). Resolved like ROOT_ID: ?scope= wins, else the
+// scope recorded in the cell's own log, else "axon" -- which is how every cell reviewed before
+// this option existed was reviewed, so old logs keep behaving exactly as they did.
+type Scope = "axon" | "all";
+const asScope = (v: string | null | undefined): Scope | null =>
+  v === "axon" || v === "all" ? v : null;
+let SCOPE: Scope = asScope(params.get("scope")) ?? "axon";
 
 const $ = (id: string) => document.getElementById(id)!;
 const status = (msg: string, cls = "") => {
@@ -454,7 +464,8 @@ function buildViewerState(state: any): any {
 const kernel = createFlyKernel({
   api: API,
   rootId: ROOT_ID,
-  compartment: "axon", // scopes background pre-build to the myelin tool's own axon sequence
+  compartment: SCOPE, // scopes background pre-build to this cell's own myelin sequence
+
   // prefetch is the newest suspect for the renderer-kill crash -- keep it on by default but let a
   // crashy session be A/B'd with ?prefetch=0 without a rebuild.
   prefetch: params.get("prefetch") !== "0",
@@ -528,8 +539,8 @@ async function markDone() {
     if (next === null || next === undefined) {
       status(
         myelinDone
-          ? `branch ${pid} done -- all axon branches reviewed`
-          : `branch ${pid} done -- all axon branches reviewed. click "cell done" if you're ` +
+          ? `branch ${pid} done -- every branch in scope reviewed`
+          : `branch ${pid} done -- every branch in scope reviewed. click "cell done" if you're ` +
             `finished with this cell`,
         "ok",
       );
@@ -564,10 +575,13 @@ function renderMyelinSummary(summary?: Record<string, number>, branches?: Branch
   }
   const cov = `to_review ${lastSummary.to_review ?? 0} -- covered ${lastSummary.covered ?? 0}`;
   const warm = branchCount ? ` | cached ${builtCount}/${branchCount}` : "";
-  $("coverage").textContent = cov + warm;
+  // Naming the scope here is what makes the cache cost legible BEFORE the sweep runs: "whole
+  // skeleton" next to a branch count several times the axon-only one is the warning.
+  const scope = SCOPE === "all" ? " | whole skeleton" : "";
+  $("coverage").textContent = cov + warm + scope;
 }
 
-// background warm-up progress (how many axon branches already have their tube built)
+// background warm-up progress (how many in-scope branches already have their tube built)
 let builtCount = 0;
 let branchCount = 0;
 
@@ -664,7 +678,7 @@ async function pollWarmProgress() {
     // the branch list is heavier, so refresh the built-count less often than the live bar
     if (i % 5 === 0) {
       try {
-        const r = await fetch(`${API}/api/cells/${ROOT_ID}/branches?compartment=axon`);
+        const r = await fetch(`${API}/api/cells/${ROOT_ID}/branches?compartment=${SCOPE}`);
         if (r.ok) {
           const data = await r.json();
           renderMyelinSummary(data.myelin_summary, data.branches);
@@ -693,18 +707,29 @@ function registerMiddleAuthToken(token: string) {
 
 async function main() {
   const cellInput = $("cellid") as HTMLInputElement;
+  const scopeSel = $("scope") as HTMLSelectElement;
   cellInput.value = ROOT_ID;
+  scopeSel.value = SCOPE;
+  // Reload with both the id AND the scope in the URL: changing EITHER is a different thing to
+  // open, so the old "same id -> nothing to do" early return would have silently swallowed a
+  // scope change on the cell already showing.
   const loadCell = () => {
     const id = cellInput.value.trim();
-    if (!id || id === ROOT_ID) return;
+    const scope = asScope(scopeSel.value) ?? "axon";
+    if (!id || (id === ROOT_ID && scope === SCOPE)) return;
     const p = new URLSearchParams(location.search);
     p.set("root", id);
+    p.set("scope", scope);
     location.search = p.toString();
   };
   ($("loadcell") as HTMLButtonElement).onclick = loadCell;
   cellInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter") loadCell();
   });
+  // Changing scope on the cell already open reloads straight away -- it changes which branches
+  // exist, the coverage denominator and what gets cached, so there's nothing useful to show
+  // between the change and the reload.
+  scopeSel.addEventListener("change", loadCell);
 
   ($("toggle") as HTMLButtonElement).onclick = () => {
     kernel.togglePlay();
@@ -763,42 +788,55 @@ async function main() {
     true,
   );
 
-  // No cell given: reopen whichever cell was last worked on, per the logs on disk -- unless it was
-  // marked done, in which case reopening it would defeat the point of marking it done.
+  // Consult the logs on disk for two things: which cell to reopen when none was given, and which
+  // scope a cell was last reviewed under. The scope lookup has to happen BEFORE the cell is
+  // opened, because opening it also kicks off the background warm-up -- guessing wrong there
+  // would cache the wrong branch set (in "all" scope, a lot of the wrong branch set).
   let askedSessions = false; // did the lookup actually answer? "no history" vs "couldn't ask"
   let lastWasDone: { root_id: string } | null = null; // set only if the skip-because-done path fires
-  if (!ROOT_ID) {
-    status("looking up your last session...");
+  const scopePinned = params.get("scope") !== null; // an explicit ?scope= beats the recorded one
+  if (!ROOT_ID || !scopePinned) {
+    if (!ROOT_ID) status("looking up your last session...");
     try {
       const sr = await fetch(`${API}/api/sessions?kind=myelin`);
       askedSessions = sr.ok;
       if (sr.ok) {
         const sessions = (await sr.json()).sessions as
-          { root_id: string | null; done?: boolean }[];
-        // Skip logs whose cell can't be identified. Those are pre-existing logs written before the
-        // segment id was recorded; opening a DIFFERENT, older cell instead would be worse than
-        // opening none, so they're skipped rather than substituted for.
-        const latest = sessions.find((s) => s.root_id);
-        if (latest?.done) {
-          // Deliberately does NOT fall through to an older, undone session -- "done" means you're
-          // finished for now, not "skip to whatever's next"; typing a cell id is the way back in.
-          lastWasDone = { root_id: latest.root_id! };
-        } else {
-          ROOT_ID = latest?.root_id ?? "";
-        }
-        const unidentified = sessions.filter((s) => !s.root_id).length;
-        if (unidentified) {
-          console.info(
-            `[myelin] ${unidentified} earlier log(s) don't record which cell they belong to, so ` +
-              `they can't be reopened automatically. Open the cell once by id and its log will be ` +
-              `renamed to include it.`,
-          );
+          { root_id: string | null; done?: boolean; scope?: string }[];
+        if (!ROOT_ID) {
+          // Skip logs whose cell can't be identified. Those are pre-existing logs written before
+          // the segment id was recorded; opening a DIFFERENT, older cell instead would be worse
+          // than opening none, so they're skipped rather than substituted for.
+          const latest = sessions.find((s) => s.root_id);
+          if (latest?.done) {
+            // Deliberately does NOT fall through to an older, undone session -- "done" means
+            // you're finished for now, not "skip to whatever's next"; typing an id is the way in.
+            lastWasDone = { root_id: latest.root_id! };
+          } else {
+            ROOT_ID = latest?.root_id ?? "";
+            if (ROOT_ID && !scopePinned) SCOPE = asScope(latest?.scope) ?? "axon";
+          }
+          const unidentified = sessions.filter((s) => !s.root_id).length;
+          if (unidentified) {
+            console.info(
+              `[myelin] ${unidentified} earlier log(s) don't record which cell they belong to, so ` +
+                `they can't be reopened automatically. Open the cell once by id and its log will ` +
+                `be renamed to include it.`,
+            );
+          }
+        } else if (!scopePinned) {
+          // Cell named explicitly (?root= or the id box): resume ITS recorded scope. A cell with
+          // no log yet simply isn't in this list, and stays on the "axon" default.
+          const row = sessions.find((s) => s.root_id === ROOT_ID);
+          if (row) SCOPE = asScope(row.scope) ?? "axon";
         }
       }
     } catch (e) {
       console.warn("[myelin] couldn't list previous sessions", e);
     }
   }
+  scopeSel.value = SCOPE;
+  kernel.setCompartment(SCOPE);
 
   if (!ROOT_ID) {
     // Stay on an empty viewer rather than opening an arbitrary cell. The cell-id box above is live,
@@ -826,9 +864,11 @@ async function main() {
     const hr = await fetch(`${API}/api/cells`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      // warm_compartment kicks off a background tube build for EVERY remaining to-review axon
-      // branch, so later branches are already cached by the time the sweep reaches them.
-      body: JSON.stringify({ root_id: ROOT_ID, datastack: DATASTACK, warm_compartment: "axon" }),
+      // warm_compartment kicks off a background tube build for EVERY remaining to-review branch
+      // IN SCOPE, so later branches are already cached by the time the sweep reaches them. In
+      // "all" scope that's the whole skeleton, which is a much larger download -- deliberate, and
+      // called out in the README next to the per-cell size estimate.
+      body: JSON.stringify({ root_id: ROOT_ID, datastack: DATASTACK, warm_compartment: SCOPE }),
     });
     if (!hr.ok) {
       // Distinguish "the backend isn't running" from "the backend ran and something upstream
@@ -868,18 +908,37 @@ async function main() {
 
   let branches: Branch[];
   try {
-    const br = await fetch(`${API}/api/cells/${ROOT_ID}/branches?compartment=axon`);
+    const br = await fetch(`${API}/api/cells/${ROOT_ID}/branches?compartment=${SCOPE}`);
     if (!br.ok) throw new Error(`HTTP ${br.status}`);
     const data = await br.json();
     branches = data.branches;
     renderMyelinSummary(data.myelin_summary || {}, branches);
     setCellDoneUI(!!data.myelin_done, data.myelin_done_ts);
+    // The scope we're actually using is now the cell's scope: record it if the log disagrees
+    // (i.e. this open came from the dropdown or an explicit ?scope=), so reopening resumes here.
+    if (asScope(data.myelin_scope) !== SCOPE) {
+      fetch(`${API}/api/cells/${ROOT_ID}/myelin/scope`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ scope: SCOPE }),
+      }).catch((e) => console.warn("[myelin] couldn't record scope", e));
+    }
   } catch (e) {
-    status(`couldn't list axon branches: ${e}`, "warn");
+    status(`couldn't list branches: ${e}`, "warn");
     return;
   }
   if (!branches.length) {
-    status("no axon-compartment branches found on this cell", "warn");
+    // In axon scope this is a dead end that whole-skeleton scope actually fixes: some cells have
+    // no axon at all, and a cell whose skeleton carries no compartment labels reads as entirely
+    // "unknown", so axon-only legitimately finds nothing. Point at the way out instead of just
+    // reporting the emptiness.
+    status(
+      SCOPE === "axon"
+        ? "no axon-compartment branches on this cell -- switch to whole skeleton above to " +
+          "annotate it anyway"
+        : "no branches found on this cell at all",
+      "warn",
+    );
     return;
   }
   renderBranches(branches);

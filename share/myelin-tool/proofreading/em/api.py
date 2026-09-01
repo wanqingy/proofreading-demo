@@ -12,19 +12,24 @@ Endpoints (M1):
                                                           (warm_compartment=axon also kicks off a
                                                           whole-cell background tube warm-up)
     GET  /api/cells/{root_id}/branches                -- branch checklist + summary
-                                                          (?compartment=axon restricts to that type)
+                                                          (?compartment=axon restricts to that type;
+                                                          =all is the whole skeleton on the myelin
+                                                          coverage dimension -- see service._scope)
     GET  /api/cells/{root_id}/branches/{pid}/camera   -- build tube + camera path payload
                                                           (includes nodes_nm, the TRUE sparse
                                                           skeleton vertices for the node overlay;
-                                                          ?compartment=axon also scopes background
+                                                          ?compartment= also scopes background
                                                           pre-build to the myelin tool's own
-                                                          axon-only, myelin-coverage sequence)
+                                                          myelin-coverage sequence)
     POST /api/cells/{root_id}/myelin/tag              -- tag the nearest skeleton node myelinated
     DELETE /api/cells/{root_id}/myelin/tag/{uuid}     -- remove a myelin tag
     GET  /api/cells/{root_id}/myelin/tags             -- live myelin tags (?path_id= restricts
                                                           to one branch)
     POST /api/cells/{root_id}/branches/{pid}/myelin-done -- mark a branch myelin-reviewed
                                                           (separate coverage dim from /done)
+    POST /api/cells/{root_id}/myelin/done             -- declare the whole cell finished (bool)
+    POST /api/cells/{root_id}/myelin/scope            -- annotate "axon" only or "all" of the
+                                                          skeleton; durable, per cell
     GET  /api/cells/{root_id}/warm-status             -- live chunk-level caching progress
                                                           (+ stalled_s to spot a wedged read)
     POST   /api/warm-queue                            -- queue N cells to cache in the
@@ -100,6 +105,10 @@ class MyelinDoneRequest(BaseModel):
     done: bool = True
 
 
+class MyelinScopeRequest(BaseModel):
+    scope: str  # "axon" | "all" -- validated in CellReviewService.set_myelin_scope
+
+
 class WarmQueueRequest(BaseModel):
     root_ids: list[int]  # warmed one cell at a time, in this order
     datastack: Optional[str] = None
@@ -131,18 +140,22 @@ _LOG_NAME_RE = re.compile(
 _ROOT_SCAN_MAX_LINES = 200
 
 
-def _scan_log(path: str, need_root: bool) -> tuple[Optional[str], bool, Optional[str]]:
-    """One pass over a log, returning ``(root_id, cell_done, cell_done_ts)``.
+def _scan_log(path: str, need_root: bool) -> tuple[Optional[str], bool, Optional[str], str]:
+    """One pass over a log, returning ``(root_id, cell_done, cell_done_ts, scope)``.
 
     ``root_id`` is only searched for (bounded, see above) when ``need_root`` -- i.e. the filename
-    itself didn't carry a ``seg`` id. ``cell_done`` is the LAST ``cell_done`` event in the file
-    (last write wins, same rule as replay in wal.py), so unlike the root-id search this can't stop
-    early and reads to EOF. Logs here are small (a session's worth of tags/visits), so a full read
-    is cheap; if that stops being true the fix is reading from the tail, not guessing.
+    itself didn't carry a ``seg`` id. ``cell_done`` and ``scope`` are the LAST such events in the
+    file (last write wins, same rule as replay in wal.py), so unlike the root-id search those
+    can't stop early and read to EOF. Logs here are small (a session's worth of tags/visits), so a
+    full read is cheap; if that stops being true the fix is reading from the tail, not guessing.
+
+    ``scope`` defaults to ``"axon"``, matching WalState -- a log with no scope event was reviewed
+    axon-only, because that was the only thing the tool could do when it was written.
     """
     root_id: Optional[str] = None
     done = False
     done_ts: Optional[str] = None
+    scope = "axon"
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             for i, line in enumerate(fh):
@@ -153,17 +166,20 @@ def _scan_log(path: str, need_root: bool) -> tuple[Optional[str], bool, Optional
                         rid = None
                     if rid:
                         root_id = str(rid)
-                if '"cell_done"' in line:
+                if '"cell_done"' in line or '"scope"' in line:
                     try:
                         ev = json.loads(line)
                     except (ValueError, TypeError):
                         continue
-                    if ev.get("event") == "cell_done":
+                    kind = ev.get("event")
+                    if kind == "cell_done":
                         done = bool(ev.get("done"))
                         done_ts = ev.get("ts")
+                    elif kind == "scope" and ev.get("scope") in ("axon", "all"):
+                        scope = ev["scope"]
     except OSError:
         pass
-    return root_id, done, done_ts
+    return root_id, done, done_ts, scope
 
 
 def create_app(
@@ -353,6 +369,13 @@ def create_app(
     def set_myelin_cell_done(root_id: int, req: MyelinDoneRequest):
         return get_session(root_id).set_myelin_cell_done(req.done)
 
+    @app.post("/api/cells/{root_id}/myelin/scope")
+    def set_myelin_scope(root_id: int, req: MyelinScopeRequest):
+        try:
+            return get_session(root_id).set_myelin_scope(req.scope)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+
     @app.get("/api/sessions")
     def list_sessions(kind: str = "myelin", limit: int = 50):
         """Cells that already have a log here, most recently worked on first.
@@ -384,7 +407,7 @@ def create_app(
             except OSError:
                 continue
             root = m.group("seg")
-            scanned_root, done, done_ts = _scan_log(path, need_root=root is None)
+            scanned_root, done, done_ts, scope = _scan_log(path, need_root=root is None)
             if root is None:
                 root = scanned_root
             if root is None:
@@ -397,7 +420,7 @@ def create_app(
                 if not sib:
                     sib = name.replace(".jsonl", "__myelin.jsonl")
                 if sib != name:
-                    root, _, _ = _scan_log(os.path.join(wal_dir, sib), need_root=True)
+                    root, _, _, _ = _scan_log(os.path.join(wal_dir, sib), need_root=True)
             out.append({
                 "root_id": root,                      # string or None if unidentifiable
                 "seed": m.group("seed"),
@@ -408,6 +431,7 @@ def create_app(
                 "mtime": st.st_mtime,
                 "done": done,
                 "done_ts": done_ts,
+                "scope": scope,   # "axon" | "all" -- reopen resumes the scope it was reviewed in
             })
         out.sort(key=lambda r: r["mtime"], reverse=True)
         return {"sessions": out[: max(1, int(limit))]}

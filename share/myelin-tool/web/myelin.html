@@ -102,6 +102,19 @@
         />
         <button id="loadcell">load</button>
       </div>
+      <!-- what to annotate: the axon only (the default, and what every log written before this
+           existed was reviewed as) or the whole skeleton. Recorded per cell, so reopening resumes
+           the same scope. Whole skeleton caches a LOT more EM -- see the README. -->
+      <div class="row" style="margin-bottom: 6px; gap: 4px">
+        <select
+          id="scope"
+          title="which part of the skeleton to annotate (recorded per cell)"
+          style="flex: 1; min-width: 0; background: #1c2740; color: #d7e3ff; border: 1px solid #3a4d78; border-radius: 5px; padding: 3px; font: inherit"
+        >
+          <option value="axon">axon only</option>
+          <option value="all">whole skeleton (much bigger cache)</option>
+        </select>
+      </div>
       <div class="row" style="margin-bottom: 6px">
         <select
           id="branch"
@@ -150,6 +163,8 @@
         passes while flying, so you don't need <b>t</b> per node<br />
         <b>cell done</b> button: the whole cell is finished -- the next time you open this tool
         with no id given, it starts empty instead of reopening this one. Click again to undo<br />
+        <b>scope</b> (above): axon only, or the whole skeleton incl. dendrites. Recorded per cell,
+        so reopening resumes it. Whole skeleton caches far more EM -- see the README<br />
         <b style="color: #33ff99">green</b> dots: myelinated tags (also browsable/deletable in
         neuroglancer's own Annotations panel)<br />
         whole cell: <b style="color: #cc66ff">magenta</b> branch points &middot;

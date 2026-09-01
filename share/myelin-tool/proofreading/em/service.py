@@ -37,6 +37,32 @@ from .wal import WAL
 _COMPARTMENT = {1: "soma", 2: "axon", 3: "dendrite"}
 
 
+def _scope(compartment: str | None) -> tuple[str | None, str]:
+    """Resolve a ``compartment`` argument into (branch filter, coverage dimension key).
+
+    Three real cases, and the middle one is the reason this exists as a function:
+
+    ======================  ===============  ==================  ==========================
+    ``compartment``         branch filter    coverage dimension  caller
+    ======================  ===============  ==================  ==========================
+    ``"axon"``              axon only        ``myelin_state``    myelin tool (default)
+    ``"all"``               none             ``myelin_state``    myelin tool, whole skeleton
+    ``None``                none             ``state``           review tool (main.ts)
+    ======================  ===============  ==================  ==========================
+
+    This used to be inlined as ``"myelin_state" if compartment == "axon" else "state"``, which
+    inferred *which tool is asking* from *which compartment it wants*. That held only while the
+    myelin tool was axon-only by construction: the moment it can sweep the whole skeleton, an
+    unfiltered myelin request would silently fall through to the ERROR-REVIEW coverage and warm
+    or prebuild the wrong branches, with nothing raised. ``"all"`` keeps the two questions apart.
+    """
+    if compartment == "axon":
+        return "axon", "myelin_state"
+    if compartment == "all":
+        return None, "myelin_state"
+    return None, "state"
+
+
 class CellReviewService:
     """Headless review state for one cell, keyed durably by its seed supervoxel."""
 
@@ -86,6 +112,9 @@ class CellReviewService:
         self.myelin_coverage = Coverage(visited_l2=set(_myelin_state.myelin_visited_l2))
         self.myelin_done = _myelin_state.cell_done
         self.myelin_done_ts = _myelin_state.cell_done_ts
+        # "axon" | "all" -- which part of the skeleton this cell is annotated over. Defaults to
+        # "axon" for any log predating the scope event, i.e. how it was actually reviewed.
+        self.myelin_scope = _myelin_state.scope
         self._resume_root_xyz = _state.root_xyz  # re-applied at the end of __init__ (below)
 
         self.tube_cache_dir = os.path.join(
@@ -271,21 +300,37 @@ class CellReviewService:
 
     def branches(self, compartment: str | None = None) -> dict:
         # ordered proximal -> distal so the checklist + auto-advance sweep the cell soma-outward.
-        # `compartment` (e.g. "axon") restricts the checklist to branches of that dominant type --
-        # used by the myelin fly-through, which should only ever offer axon branches.
+        # `compartment` restricts the checklist -- "axon" to that dominant type, "all" to the whole
+        # skeleton with the myelin coverage dimension, absent for main.ts's unfiltered sweep.
+        comp_filter, _ = _scope(compartment)
         all_metas = [self.branch_metadata(i) for i in self._branch_order()]
-        metas = [m for m in all_metas if m["compartment"] == compartment] if compartment else all_metas
-        # myelin_summary is always scoped to axon branches (the only ones this dimension ever
-        # covers), regardless of `compartment` -- otherwise "done" could never reach 0, since
-        # dendrite/soma branches are never myelin-reviewed.
-        axon_metas = [m for m in all_metas if m["compartment"] == "axon"]
+        metas = (
+            [m for m in all_metas if m["compartment"] == comp_filter] if comp_filter else all_metas
+        )
+        # myelin_summary counts the set actually being myelin-reviewed, which is why it follows the
+        # scope rather than the raw filter: pinned to axon it could never reach 0 in whole-skeleton
+        # scope, and pinned to `metas` it would read 0/0 for main.ts, which doesn't review myelin.
+        summary_metas = self._myelin_scope_metas(all_metas, compartment)
         return {
             "branches": metas,
             "summary": self.coverage.summary(self.tree),
-            "myelin_summary": self._tally_myelin_state(axon_metas),
+            "myelin_summary": self._tally_myelin_state(summary_metas),
             "myelin_done": self.myelin_done,
             "myelin_done_ts": self.myelin_done_ts,
+            "myelin_scope": self.myelin_scope,
         }
+
+    def _myelin_scope_metas(self, all_metas: list[dict], compartment: str | None = None) -> list[dict]:
+        """The branches the myelin dimension covers: everything in "all" scope, axon otherwise.
+
+        ``compartment`` lets a caller ask about a scope other than the session's persisted one
+        (the branches endpoint takes it straight from the URL); everything else passes None and
+        gets the cell's own recorded scope.
+        """
+        scope = compartment if compartment in ("axon", "all") else self.myelin_scope
+        if scope == "all":
+            return all_metas
+        return [m for m in all_metas if m["compartment"] == "axon"]
 
     # ------------------------------------------------------------------ #
     # camera path (+ build the branch tube)
@@ -347,22 +392,21 @@ class CellReviewService:
         ``compartment`` scopes this to the SAME sequence the caller is actually navigating.
         Without it, this walks the full, unfiltered branch order using the error-review
         coverage (``self.coverage``) -- correct for main.ts's unfiltered sweep, but WRONG for
-        the myelin fly-through, which only ever visits axon branches in myelin-coverage order:
+        the myelin fly-through, which visits its own branch set in myelin-coverage order:
         prebuilding from the unfiltered order would almost always guess a branch the myelin
-        tool was never going to load next (a dendrite branch, or an axon branch it already
-        marked myelin-covered), wasting the one background worker while the branch actually
-        coming up next builds on-demand instead. ``compartment="axon"`` switches both the
-        candidate list and the coverage dimension checked to ``myelin_coverage``, matching
-        ``branches(compartment="axon")``/``myelin_mark_done``'s own axon-scoped sequence.
+        tool was never going to load next (one it already marked myelin-covered, or -- in axon
+        scope -- a dendrite branch), wasting the one background worker while the branch actually
+        coming up next builds on-demand instead. See :func:`_scope` for how ``"axon"``/``"all"``
+        select both the candidate list and the coverage dimension.
         """
         if self.prebuild_ahead <= 0:
             return []
+        comp_filter, state_key = _scope(compartment)
         all_metas = {pid: self.branch_metadata(pid) for pid in self._branch_order()}
         order = [
             pid for pid in self._branch_order()
-            if compartment is None or all_metas[pid]["compartment"] == compartment
+            if comp_filter is None or all_metas[pid]["compartment"] == comp_filter
         ]
-        state_key = "myelin_state" if compartment == "axon" else "state"
         try:
             start = order.index(int(after_path_id)) + 1
         except ValueError:
@@ -432,12 +476,12 @@ class CellReviewService:
         That is what makes a queued cell interruptible between branches, and what lets the
         queue know how much work a cell actually represents before it starts.
         """
+        comp_filter, state_key = _scope(compartment)
         all_metas = {pid: self.branch_metadata(pid) for pid in self._branch_order()}
         order = [
             pid for pid in self._branch_order()
-            if compartment is None or all_metas[pid]["compartment"] == compartment
+            if comp_filter is None or all_metas[pid]["compartment"] == comp_filter
         ]
-        state_key = "myelin_state" if compartment == "axon" else "state"
         pending: list[int] = []
         already_built = 0
         for pid in order:
@@ -555,12 +599,15 @@ class CellReviewService:
     # a tag on a node means myelinated; absence means the unmyelinated default.
     # ------------------------------------------------------------------ #
     def tag_myelinated_node(self, xyz_nm, path_id: int | None = None) -> dict:
-        """Tag the single skeleton vertex nearest ``xyz_nm`` as myelinated. Warns (does not
-        block) if that vertex isn't classified as axon -- compartment labels can be imperfect.
+        """Tag the single skeleton vertex nearest ``xyz_nm`` as myelinated. In axon scope, warns
+        (does not block) if that vertex isn't classified as axon -- compartment labels can be
+        imperfect, so an off-axon tag is worth flagging but not refusing.
         """
         vertex = int(self.tree.nearest_vertex(xyz_nm))
         warning = None
-        if self.tree.compartment is not None:
+        # In "all" scope, tagging a dendrite is the POINT, so the warning would fire on nearly
+        # every tag -- and a warning that always fires is one you stop reading.
+        if self.myelin_scope != "all" and self.tree.compartment is not None:
             code = int(self.tree.compartment[vertex])
             comp = _COMPARTMENT.get(code, "unknown")
             if comp != "axon":
@@ -591,8 +638,35 @@ class CellReviewService:
             "myelin_done": self.myelin_done,
             "myelin_done_ts": self.myelin_done_ts,
             "myelin_summary": self._tally_myelin_state(
-                [m for m in (self.branch_metadata(i) for i in self._branch_order())
-                 if m["compartment"] == "axon"]
+                self._myelin_scope_metas(
+                    [self.branch_metadata(i) for i in self._branch_order()]
+                )
+            ),
+        }
+
+    def set_myelin_scope(self, scope: str) -> dict:
+        """Set which part of the skeleton this cell is annotated over ("axon" | "all").
+
+        Durable, because it changes what "reviewed" and "cell done" mean for this cell, and
+        because reopening should resume the scope you were working in rather than snapping back
+        to the axon default. Deliberately does NOT touch the done mark: switching scope on a
+        finished cell leaves it marked (the badge and `undo cell done` are right there) -- quietly
+        clearing a durable mark because a dropdown moved is exactly what makes a log untrustworthy.
+        """
+        if scope not in ("axon", "all"):
+            raise ValueError(f"unknown scope {scope!r}; expected 'axon' or 'all'")
+        self.myelin_wal.set_scope(scope)
+        self.myelin_scope = scope
+        all_metas = [self.branch_metadata(i) for i in self._branch_order()]
+        comp_filter, _ = _scope(scope)
+        return {
+            "myelin_scope": self.myelin_scope,
+            "branches": (
+                [m for m in all_metas if m["compartment"] == comp_filter]
+                if comp_filter else all_metas
+            ),
+            "myelin_summary": self._tally_myelin_state(
+                self._myelin_scope_metas(all_metas, scope)
             ),
         }
 
@@ -724,7 +798,10 @@ class CellReviewService:
     def myelin_mark_done(self, path_id: int) -> dict:
         """Mark a branch reviewed FOR MYELINATION (a separate coverage dimension from
         :meth:`mark_done` -- see wal.py's ``myelin_visit`` docstring), and advance to the next
-        to-review AXON branch specifically (the myelin tool only ever offers axon branches).
+        to-review branch within this cell's myelin scope (axon only, or the whole skeleton).
+
+        Reads ``self.myelin_scope`` rather than taking a compartment argument: it's a myelin-only
+        method, and the scope is a durable property of the cell, not of the request.
         """
         pid = int(path_id)
         bp = self.tree.branch_paths[pid]
@@ -732,14 +809,15 @@ class CellReviewService:
         self.myelin_wal.mark_myelin_visited(l2, root_id=self.root_id)
         self.myelin_coverage.mark_visited(l2)
         todo = set(self.myelin_coverage.to_review(self.tree))
-        axon_metas = [self.branch_metadata(i) for i in self._branch_order()]
-        axon_metas = [m for m in axon_metas if m["compartment"] == "axon"]
-        next_pid = next((m["path_id"] for m in axon_metas if m["path_id"] in todo), None)
+        scope_metas = self._myelin_scope_metas(
+            [self.branch_metadata(i) for i in self._branch_order()]
+        )
+        next_pid = next((m["path_id"] for m in scope_metas if m["path_id"] in todo), None)
         return {
             "path_id": pid,
             "next_path_id": next_pid,
-            "myelin_summary": self._tally_myelin_state(axon_metas),
-            "branches": axon_metas,
+            "myelin_summary": self._tally_myelin_state(scope_metas),
+            "branches": scope_metas,
         }
 
     def omit_branch(self, path_id: int) -> dict:

@@ -35,6 +35,11 @@ Events
   particular branch's state. Reversible like ``ann_status``: last write wins. Written to the
   myelin stream only, by the myelin tool's "cell done" action -- it says nothing about the
   review pass, same separation as ``myelin_visit`` vs ``visit`` above.
+- ``scope`` -- which part of the skeleton this cell is being annotated over: ``"axon"`` (the
+  default) or ``"all"`` (the whole skeleton, including dendrite/soma/unclassified branches).
+  Last write wins. Recorded so reopening a cell resumes the scope it was reviewed under, and so
+  a log is self-describing about what "reviewed" covered. **A log with no ``scope`` event is
+  axon-only** -- which is exactly how everything written before this event existed was reviewed.
 
 One log per cell **per event vocabulary**, named by the **seed supervoxel** (the durable
 identity) so a later session over a new root id appends to and resumes the same log(s). The
@@ -98,6 +103,11 @@ class WalState:
     myelin_tags: Dict[str, MyelinTag] = field(default_factory=dict)  # live (un-tombstoned), uuid-keyed
     cell_done: bool = False  # this whole cell declared finished (last cell_done event wins)
     cell_done_ts: Optional[str] = None
+    # Which part of the skeleton this cell is being annotated over: "axon" (the historical and
+    # default behaviour) or "all". Defaulting to "axon" IS the back-compat story -- every log
+    # written before this event existed replays as axon-only, exactly as it was reviewed. A string
+    # rather than Optional[str] on purpose: "unset" and "whole skeleton" must not be confusable.
+    scope: str = "axon"
 
 
 class WAL:
@@ -258,6 +268,12 @@ class WAL:
         # log. Written to whichever stream this WAL instance is (myelin, in the one caller today).
         self._write({"event": "cell_done", "done": bool(done)})
 
+    def set_scope(self, scope: str) -> None:
+        """Record which part of the skeleton this cell is being annotated over ("axon" | "all")."""
+        if scope not in ("axon", "all"):
+            raise ValueError(f"unknown scope {scope!r}; expected 'axon' or 'all'")
+        self._write({"event": "scope", "scope": scope})
+
     def close(self) -> None:
         self._fh.close()
 
@@ -320,6 +336,10 @@ class WAL:
                 elif kind == "cell_done":
                     state.cell_done = bool(ev.get("done"))  # last event wins -- file order
                     state.cell_done_ts = ev.get("ts")
+                elif kind == "scope":
+                    s = ev.get("scope")
+                    if s in ("axon", "all"):  # ignore anything unrecognised rather than crash
+                        state.scope = s       # last event wins
         # apply tombstones: drop annotations and reverse any omissions they caused
         for u in tombstoned:
             state.annotations.pop(u, None)

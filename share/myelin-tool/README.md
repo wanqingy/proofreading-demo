@@ -25,6 +25,32 @@ for you to type a cell id (`864691136335553971` is a good one to start with — 
 `?root=<id>` opens a specific cell regardless, e.g. `http://localhost:8000/?root=864691135572530981`
 — including one you've already marked done; the badge just tells you so.
 
+### Axon only, or the whole skeleton
+
+The dropdown under the cell id chooses what you're annotating:
+
+| scope | what you get |
+|---|---|
+| **axon only** (default) | just the axon-compartment branches — the historical behaviour |
+| **whole skeleton** | every branch, including dendrite and soma |
+
+The choice is **recorded per cell**, so reopening resumes the scope you were working in, and
+`?scope=axon` / `?scope=all` overrides it for one load. It's per cell, not global: you can review
+one cell axon-only and the next one whole.
+
+Two reasons to reach for whole skeleton. First, **some cells have no axon at all** (see below), and
+axon-only shows you an empty branch picker for those — whole skeleton is how you annotate them.
+Second, compartment labels come from the skeleton service and aren't perfect, so axon-only can
+silently drop a branch that really is axon.
+
+**It also caches more EM — see the numbers below before you switch.** Judge it by *path length*,
+not branch count: the example cell has 2.7× as many branches in whole-skeleton scope but only
+1.6× the path length, because dendrite branches are much shorter individually (~41 µm vs ~119 µm
+here). Cache size tracks length almost exactly, since the tube is a fixed 1 µm radius around the
+centerline whatever the compartment, and neighbouring tubes barely overlap — under 5% of the EM
+chunks that dominate the total are shared. The HUD shows `cached N/M` with `whole skeleton` beside
+it so you can see the count.
+
 ## Using it
 
 The camera flies down one axon branch at a time. At any point:
@@ -35,7 +61,7 @@ The camera flies down one axon branch at a time. At any point:
 | `t` | tag the nearest skeleton node **myelinated** (default: untagged = unmyelinated) |
 | `d` | delete the nearest tag |
 | `p` | start/stop **painting** — auto-tags every node the camera passes while flying, so you don't have to hit `t` per node on a long myelinated stretch |
-| `x` | mark this branch reviewed and advance to the next |
+| `x` | mark this branch reviewed and advance to the next (within the current scope) |
 
 Green dots are myelinated tags — they're real Neuroglancer annotations, so they're also
 visible and deletable in Neuroglancer's own **Annotations** panel, not just through this UI.
@@ -163,9 +189,26 @@ thread being overwhelmed rather than memory.
 - **The first branch takes a couple of minutes.** Flying a branch means fetching its EM +
   segmentation-mask image chunks from Google Cloud Storage into a local cache before the
   camera can glide over it. Later visits to the same branch are instant.
-- **A whole cell is ~30 min and a few GB**, at the default coarse mask resolution
-  (`PROOFREAD_TGT_MIP=4` — a deliberate speed/fidelity tradeoff; see `tube.py` if you want the
-  sharper, slower alternative).
+- **Budget ~1.7 GB per mm of skeleton**, and expect a cell to take tens of minutes. Almost all of
+  it is **raw EM**: the mask is cached at `PROOFREAD_TGT_MIP=4`, 8×8×2 coarser than the image, so
+  it costs about **5%** of what the EM does. Measured on two real cells (`864691136335553971`,
+  `864691135572530981`), and the two scopes side by side:
+
+  | | axon only | whole skeleton |
+  |---|---|---|
+  | raw EM (16×16×40) | 10.7 / 12.2 GB | 16.8 / 23.4 GB |
+  | segmentation mask (mip 4) | 0.56 / 0.63 GB | 0.87 / 1.22 GB |
+  | **total** | **11.3 / 12.8 GB** | **17.7 / 24.6 GB** |
+  | path length | 6.8 / 7.6 mm | 10.7 / 14.8 mm |
+
+  So whole-skeleton costs **1.6–1.9× axon-only** on these cells, i.e. **+6 to +12 GB**, and ~95% of
+  that increase is raw EM. Both sources store 256 KiB per 64³ chunk, so size is purely a chunk
+  count — which is why it tracks path length so closely.
+
+  **The mask mip is the one setting that changes this shape.** At `PROOFREAD_TGT_MIP=1` (the
+  sharper, slower alternative — see `tube.py`) the mask is fetched at full image resolution and
+  costs the *same as the EM*, so the total roughly doubles and the split becomes ~50/50. Older
+  cells in this cache were built that way and show exactly that: 3.85 GB EM against 3.83 GB mask.
 - **Queue cells ahead of time** instead of waiting branch-by-branch:
   ```bash
   uv run python -m proofreading.em.warm_cells 864691136335553971 864691135572530981
@@ -180,14 +223,20 @@ thread being overwhelmed rather than memory.
   uv run python -m proofreading.em.clear_cache --stale-masks -f
   ```
 - **Some cells genuinely have no axon** in this dataset (e.g. `864691136420378007`,
-  `864691135492640607`, `864691136927797322`) — an empty branch picker for one of those is
-  correct behavior, not a bug.
+  `864691135492640607`, `864691136927797322`) — an empty branch picker for one of those is correct
+  behavior in axon scope, not a bug. Switch the scope dropdown to **whole skeleton** and they open
+  normally (`864691136420378007` is 159 dendrite/soma branches). The same is true of any cell whose
+  skeleton carries no compartment labels at all: every branch reads as "unknown", so axon-only
+  legitimately finds nothing.
 
 ## Where your data goes
 
 Every tag you place or delete is appended to
 `proofread_sessions/<datastack>__seg<root_id>__seed<supervoxel>__myelin.jsonl` — one line per
-action, `fsync`'d before the keystroke returns and never rewritten in place.
+action, `fsync`'d before the keystroke returns and never rewritten in place. The same log records
+the two per-cell settings, so they survive a reload and a machine change: whether you marked the
+cell done, and which scope you're annotating it in. **A log with no scope line is axon-only** —
+which is how everything written before that option existed was in fact reviewed.
 
 The filename carries both ids, but the tool **finds** your log by the **seed supervoxel**, not by
 the root id, so your progress survives the root id changing underneath you (segmentation edits

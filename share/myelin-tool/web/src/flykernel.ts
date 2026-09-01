@@ -52,8 +52,9 @@ export interface FlyKernelOptions {
   // fired before a branch switch begins
   onBeforeLoadBranch?: (pid: number) => void | Promise<void>;
   // scopes the camera fetch's background pre-build to this compartment's own review sequence
-  // (e.g. "axon" for the myelin tool) instead of the unfiltered, error-review-coverage default
-  // -- see proofreading/em/service.py's _queue_prebuild docstring.
+  // ("axon" or "all" for the myelin tool) instead of the unfiltered, error-review-coverage default
+  // -- see proofreading/em/service.py's _scope / _queue_prebuild docstrings. Like rootId, it may
+  // not be known at construction (it's recorded per cell), so it can be set later.
   compartment?: string;
   // Neuroglancer's velocity-based prefetch (default on -- see setupViewer). Exposed so it can be
   // turned off WITHOUT a rebuild when diagnosing a renderer kill: prefetch adds download/decode
@@ -145,6 +146,9 @@ export interface FlyKernel {
   /** Point the kernel at a (different) cell. Needed because the kernel is constructed before the
    * page knows which cell to open -- see FlyKernelOptions.rootId. */
   setRootId(id: string): void;
+  /** Scope the camera fetch's background pre-build -- same reason as setRootId: the cell's
+   * recorded scope isn't known until it's been looked up. See FlyKernelOptions.compartment. */
+  setCompartment(compartment: string): void;
   /** What is actually on screen right now: chunks in the 2D panel's footprint classified into real
    * (has image), absent (404 -- black forever) and pending (still coming). `pastStrip` is true once
    * a meaningful share of the view is absent, i.e. black for want of DATA rather than of time. */
@@ -185,6 +189,7 @@ export function createFlyKernel(opts: FlyKernelOptions): FlyKernel {
   let frames = 0;
   let annRankNotified = false;
   let rootId = opts.rootId;
+  let compartment = opts.compartment;
 
   const setPosition = (vox: [number, number, number]) => {
     try {
@@ -774,7 +779,7 @@ export function createFlyKernel(opts: FlyKernelOptions): FlyKernel {
     phase = "buffer";
     status(`branch ${pid}: fetching camera path (building tube if first visit)...`);
     const url = new URL(`${opts.api}/api/cells/${rootId}/branches/${pid}/camera`);
-    if (opts.compartment) url.searchParams.set("compartment", opts.compartment);
+    if (compartment) url.searchParams.set("compartment", compartment);
     const r = await fetch(url.toString());
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const cam: Camera = await r.json();
@@ -821,6 +826,9 @@ export function createFlyKernel(opts: FlyKernelOptions): FlyKernel {
     loadBranch,
     setRootId: (id: string) => {
       rootId = id;
+    },
+    setCompartment: (c: string) => {
+      compartment = c;
     },
     getBufferDepth: () => depth,
     getCrashReport: () => crash.report(),
