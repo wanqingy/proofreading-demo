@@ -256,6 +256,9 @@ class ProofreadSession:
         if self._tube is None:
             self._tube = T.CellTube(
                 self.client, self.root_id, self.tube_mip, self.tube_radius_nm, self.tube_cache_dir,
+                # agglomerate as of this root's own creation, or the mask silently comes out empty
+                # for any root that has been edited since -- see EMClient.agg_seg_cv
+                agg_timestamp=self.client.root_timestamp(self.root_id),
             )
         if not self._tube_layers_added:
             base = self._tube.serve()

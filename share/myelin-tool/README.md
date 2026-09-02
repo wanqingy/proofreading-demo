@@ -118,6 +118,15 @@ Two things that will *not* help, both measured rather than guessed: raising the 
 downloads (the browser only opens 6 connections no matter what the setting says), and waiting longer
 (the missing tiles do not exist). Zooming back in is the only way to see image everywhere.
 
+### If the red mask doesn't appear
+
+The red tint marks "this voxel belongs to the cell". If it's missing everywhere while the EM looks
+fine, the tool now tells you rather than leaving you to notice an absence: the HUD shows **"no red
+overlay: mask is empty for this branch"**, and the server log carries the same warning with the
+chunk count. An empty mask means no voxel in the fetched segmentation matched the cell's id — most
+often a mask mip or datastack mismatch. It is *not* caused by a root id being old; that case is
+handled (see the note about edited ids under **What to expect**).
+
 ### Stopping for the day
 
 **There is nothing to save, so close it however you like.** Every tag is appended and `fsync`'d to
@@ -228,6 +237,13 @@ thread being overwhelmed rather than memory.
   normally (`864691136420378007` is 159 dendrite/soma branches). The same is true of any cell whose
   skeleton carries no compartment labels at all: every branch reads as "unknown", so axon-only
   legitimately finds nothing.
+- **An id that has been edited since still opens, and shows the cell as it was then.** Root ids
+  change whenever anyone proofreads, and this tool takes you at your word: it fetches the skeleton
+  *and* the segmentation mask as of the moment that id existed, so the two always agree. The HUD
+  says so — *"cell … has been edited since 2024-10-23 — showing the segmentation as it was then"* —
+  because it matters for what your tags mean. If you want the cell as it is **now**, look the
+  current id up in CAVE and paste that instead; a single old id can correspond to many current
+  segments after splits.
 
 ## Where your data goes
 

@@ -181,12 +181,16 @@ def build_local_tube(emclient, points_nm, mip, radius_nm, cache_dir, name, **kw)
 
 def build_branch_tube(
     emclient, points_nm, root_id, mip, radius_nm, cache_dir, name,
-    *, workers: int = 16, force: bool = False, verbose: bool = True,
+    *, workers: int = 16, force: bool = False, verbose: bool = True, agg_timestamp=None,
 ) -> dict:
     """Build the EM tube and the target-mask tube (``agg_seg == root_id``) **concurrently**.
 
     Returns ``{em_name, tgt_name, em, tgt}``. Each sub-build skips if already complete
     (``.tube_done`` marker), so revisiting a branch is instant.
+
+    ``agg_timestamp`` pins when the segmentation is agglomerated -- pass the root's own creation
+    time so the mask matches the root even after it stops being current (see
+    :meth:`EMClient.agg_seg_cv`).
     """
     em_name, tgt_name = name + "_em", name + "_tgt"
     root = int(root_id)
@@ -197,7 +201,8 @@ def build_branch_tube(
 
     def _tgt():
         return build_local_volume(
-            emclient.agg_seg_cv(int(mip)), points_nm, radius_nm, cache_dir, tgt_name,
+            emclient.agg_seg_cv(int(mip), timestamp=agg_timestamp), points_nm, radius_nm,
+            cache_dir, tgt_name,
             transform=lambda d: ((np.asarray(d) == np.uint64(root)) * 255).astype(np.uint8),
             workers=workers, force=force, verbose=verbose,
         )
@@ -272,7 +277,12 @@ def branch_marker_state(markers_dir, path_id, em_mip, tgt_mip) -> tuple:
 
 def _fill_chunks(local, src, points_nm, radius_nm, transform, workers, budget_s,
                  on_progress=None) -> tuple:
-    """Copy the tube's chunks from ``src`` into ``local`` (parallel). Returns (bytes, fails, n).
+    """Copy the tube's chunks from ``src`` into ``local`` (parallel).
+
+    Returns ``(bytes, fails, n, hits)``, where ``hits`` counts the voxels the ``transform`` marked
+    (0 when there is no transform). For the mask that is "how many voxels belong to this root" --
+    and a whole branch coming back with ZERO hits is the signature of a mask that will render
+    invisibly. That used to be silent; the caller now reports it.
 
     ``budget_s`` caps the WHOLE copy: the tube data is served from one host (GCS), whose HTTP
     connection pool is small, and CloudVolume reads have no socket timeout -- so a wedged read
@@ -291,31 +301,35 @@ def _fill_chunks(local, src, points_nm, radius_nm, transform, workers, budget_s,
     bmax = np.asarray(b.maxpt, dtype=np.int64)
     boxes = tube_chunks(points_nm, off, res, [64, 64, 64], radius_nm)
 
-    def work(box) -> int:
+    def work(box) -> tuple:
+        """-> (bytes, hits). bytes < 0 marks a failed read (work() never raises)."""
         lo = np.maximum(box[0], off)
         hi = np.minimum(box[1], bmax)
         if np.any(hi <= lo):
-            return 0
+            return 0, 0
         try:
             d = np.asarray(src[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]])
+            hits = 0
             if transform is not None:
                 d = transform(d)
+                hits = int(np.count_nonzero(d))
             local[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]] = d
-            return int(d.size)
+            return int(d.size), hits
         except Exception:
-            return -1
+            return -1, 0
 
     ex = ThreadPoolExecutor(max_workers=workers)
     futs = [ex.submit(work, box) for box in boxes]
-    nbytes = fails = done = 0
+    nbytes = fails = done = hits = 0
     if on_progress:
         on_progress(0, len(boxes))
     try:
         for f in as_completed(futs, timeout=budget_s):
             done += 1
-            s = f.result()  # work() swallows read errors -> -1; never raises
+            s, h = f.result()  # work() swallows read errors -> -1; never raises
             if s > 0:
                 nbytes += s
+                hits += h
             elif s < 0:
                 fails += 1
             if on_progress:
@@ -325,7 +339,7 @@ def _fill_chunks(local, src, points_nm, radius_nm, transform, workers, budget_s,
     finally:
         # wait=False so a wedged GCS read can't re-hang us on shutdown; cancel any not-yet-started
         ex.shutdown(wait=False, cancel_futures=True)
-    return nbytes, fails, len(boxes)
+    return nbytes, fails, len(boxes), hits
 
 
 class CellTube:
@@ -360,7 +374,8 @@ class CellTube:
     # for a cell where that matters.
     DEFAULT_TGT_MIP = int(os.environ.get("PROOFREAD_TGT_MIP", "4"))
 
-    def __init__(self, emclient, root_id, mip, radius_nm, cache_dir, tgt_mip=None):
+    def __init__(self, emclient, root_id, mip, radius_nm, cache_dir, tgt_mip=None,
+                 agg_timestamp=None):
         self.root = int(root_id)
         self.mip = int(mip)
         self.tgt_mip = int(self.DEFAULT_TGT_MIP if tgt_mip is None else tgt_mip)
@@ -374,9 +389,16 @@ class CellTube:
         # must not append coarse chunks into a volume whose `info` declares a finer resolution.
         tgt_dir = self.tgt_name if self.tgt_mip == self.mip else f"{self.tgt_name}_mip{self.tgt_mip}"
         self.tgt_name_dir = tgt_dir
+        # agg_timestamp: agglomerate as of the root's own creation, so `== root` still matches for
+        # a root that is no longer current. Without it the mask silently builds ALL ZEROS for any
+        # historical root -- see EMClient.agg_seg_cv.
+        self.agg_timestamp = agg_timestamp
         self.tgt_local, self.tgt_src = _open_shared(
-            emclient.agg_seg_cv(self.tgt_mip), self.cache_dir, tgt_dir
+            emclient.agg_seg_cv(self.tgt_mip, timestamp=agg_timestamp), self.cache_dir, tgt_dir
         )
+        # set by fill_branch: whether the last mask fill matched any voxel at all (see there)
+        self.last_tgt_hits = 0
+        self.empty_mask = False
         self._markers = os.path.join(self.cache_dir, "_branches")
         os.makedirs(self._markers, exist_ok=True)
 
@@ -430,16 +452,28 @@ class CellTube:
         # the mask, and a phase that failed last time isn't re-done alongside one that succeeded.
         em_b = em_f = em_n = 0
         if force or not em_done:
-            em_b, em_f, em_n = _fill_chunks(self.em_local, self.em_src, rs, self.radius_nm, None,
-                                            workers, budget_s, on_progress=cb("em"))
+            em_b, em_f, em_n, _ = _fill_chunks(self.em_local, self.em_src, rs, self.radius_nm, None,
+                                               workers, budget_s, on_progress=cb("em"))
             if em_f == 0:
                 _mark(f"path_{pid}.em.done")
-        tg_b = tg_f = tg_n = 0
+        tg_b = tg_f = tg_n = tg_hits = 0
+        built_tgt = False
         if force or not tgt_done:
-            tg_b, tg_f, tg_n = _fill_chunks(self.tgt_local, self.tgt_src, rs, self.radius_nm, tint,
-                                            workers, budget_s, on_progress=cb("tgt"))
+            built_tgt = True
+            tg_b, tg_f, tg_n, tg_hits = _fill_chunks(
+                self.tgt_local, self.tgt_src, rs, self.radius_nm, tint,
+                workers, budget_s, on_progress=cb("tgt"))
             if tg_f == 0:
                 _mark(f"path_{pid}.tgt{self.tgt_mip}.done")
+        # A mask that matched NOTHING renders as a perfectly invisible overlay, which is
+        # indistinguishable from "this tool has no mask feature" -- so say it out loud rather than
+        # leaving the user to notice an absence. Usually means the agglomeration timestamp doesn't
+        # cover this root (see EMClient.agg_seg_cv), or the mask mip/datastack is wrong.
+        self.last_tgt_hits = tg_hits
+        self.empty_mask = bool(built_tgt and tg_n > 0 and tg_f == 0 and tg_hits == 0)
+        if self.empty_mask:
+            print(f"tube path_{pid}: WARNING mask is EMPTY -- no voxel in {tg_n} chunks belongs to "
+                  f"root {self.root}. The overlay will be invisible.", flush=True)
         dt = time.time() - t0
         if verbose:
             print(f"tube path_{int(path_id)}: {em_n + tg_n} chunks  "

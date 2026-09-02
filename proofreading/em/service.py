@@ -94,9 +94,18 @@ class CellReviewService:
         self.seed = emclient.seed_supervoxel(self.sk)
         self.mat_version = int(emclient.mat_version)
 
-        # pre-warm the tube-mip CloudVolumes so threadpool handlers only READ the caches
+        # WHEN to agglomerate the segmentation for the mask. The skeleton service serves historical
+        # roots quite happily, so without this the fly-through of an edited-since cell looks perfect
+        # while its mask matches zero voxels and renders invisible (observed on 864691135572519149).
+        # Resolved once per session; None just means "live agglomeration", i.e. the old behaviour.
+        self.agg_timestamp = emclient.root_timestamp(self.root_id)
+        self.root_is_current = emclient.is_current_root(self.root_id)
+
+        # pre-warm the tube-mip CloudVolumes so threadpool handlers only READ the caches. Warm the
+        # SAME (mip, timestamp) the mask build will ask for, or the warm-up populates a different
+        # cache entry than the one that gets used.
         self.res = np.asarray(emclient.image_cloudvolume(self.tube_mip).resolution).tolist()
-        emclient.agg_seg_cv(self.tube_mip)
+        emclient.agg_seg_cv(self.tube_mip, timestamp=self.agg_timestamp)
 
         # durable state (resumes prior coverage if a log already exists)
         self.wal = WAL.for_cell(wal_dir, self.datastack, self.seed, root_id=self.root_id)
@@ -165,6 +174,7 @@ class CellReviewService:
                     self._tube = CellTube(
                         self.client, self.root_id, self.tube_mip,
                         self.tube_radius_nm, self.tube_cache_dir, tgt_mip=self.tgt_mip,
+                        agg_timestamp=self.agg_timestamp,
                     )
         return self._tube
 
@@ -380,6 +390,12 @@ class CellReviewService:
             "tgt_rel": f"{rel}/{tube.tgt_name_dir}",
             "build": {"cached": bool(cached), "seconds": seconds},
             "prebuilding": prebuilding,
+            # Set only when this branch's mask was just built and matched NOTHING -- an overlay
+            # that renders perfectly invisibly, which the user can only detect as an absence.
+            "mask_warning": (
+                f"mask is empty for this branch -- no voxel belongs to root {self.root_id}"
+                if getattr(tube, "empty_mask", False) else None
+            ),
         }
 
     # ------------------------------------------------------------------ #
@@ -936,6 +952,12 @@ class CellReviewService:
             "step_nm": self.step_nm,
             "summary": self.coverage.summary(self.tree),
             "tube_rel": f"tube/{self.datastack}/{self.root_id}",
+            # False means this root has been edited since and is no longer a leaf of the
+            # chunkedgraph. Everything still works -- the skeleton and the mask are both served as
+            # of `agg_timestamp` -- but you are reviewing the cell AS IT WAS, which is worth
+            # knowing before you tag it. None = couldn't check (offline); don't claim either way.
+            "root_is_current": self.root_is_current,
+            "root_timestamp": None if self.agg_timestamp is None else str(self.agg_timestamp),
         }
 
     def close(self) -> None:

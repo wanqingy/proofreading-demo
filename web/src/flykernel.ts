@@ -37,6 +37,10 @@ export interface Camera {
   tgt_source: string;
   build: { cached: boolean; seconds: number };
   prebuilding?: number[];
+  /** Set when this branch's mask was just built and matched no voxels at all -- i.e. the overlay
+   * will render completely invisibly. Consumers should surface it; an absent overlay is otherwise
+   * indistinguishable from the tool not having one. */
+  mask_warning?: string | null;
 }
 
 export interface FlyKernelOptions {

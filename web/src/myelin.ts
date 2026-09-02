@@ -78,6 +78,18 @@ const status = (msg: string, cls = "") => {
 };
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+// Sticky warnings that must outlive the next status update (a historical root, an empty mask).
+// `#status` is overwritten by every branch load, so anything the user needs to keep seeing while
+// they work goes here instead. Repeated calls with the same text don't stack.
+const noticed = new Set<string>();
+function showNotice(msg: string) {
+  if (noticed.has(msg)) return;
+  noticed.add(msg);
+  const el = $("notice");
+  el.textContent = [...noticed].join(" | ");
+  el.style.display = "";
+}
+
 // whole-cell skeleton guidance markers (mirrors main.ts's M4.2 skel:branch / skel:end layers):
 // branch points + tips for the ENTIRE cell, fetched once per cell-open from /skeleton-features,
 // so you can see where the current branch sits in the whole arbor. The 3D skeleton mesh layer
@@ -516,6 +528,8 @@ async function loadBranchAndRefresh(pid: number) {
     currentNodesNm = cam.nodes_nm; // still the paint/tag snap targets, just no longer drawn
     ($("branch") as HTMLSelectElement).value = String(pid);
     updatePlayButton();
+    // An all-zero mask renders as nothing at all, so the only way to notice is to be told.
+    if (cam.mask_warning) showNotice(`no red overlay: ${cam.mask_warning}`);
     await refreshTags(pid);
   } catch (e) {
     status(`branch load failed: ${e}`, "warn");
@@ -722,6 +736,23 @@ async function main() {
     p.set("scope", scope);
     location.search = p.toString();
   };
+  // The key legend is collapsed by default to keep the panel small, but this tool full-page-reloads
+  // on every cell/scope change -- so remember whether you opened it, or it would snap shut on you
+  // several times an hour.
+  const legendBox = $("legendbox") as HTMLDetailsElement;
+  try {
+    legendBox.open = localStorage.getItem("myelin.legendOpen") === "1";
+    legendBox.addEventListener("toggle", () => {
+      try {
+        localStorage.setItem("myelin.legendOpen", legendBox.open ? "1" : "0");
+      } catch {
+        /* private mode / quota -- the panel still works, it just won't remember */
+      }
+    });
+  } catch {
+    /* storage unavailable: fall back to the collapsed default */
+  }
+
   ($("loadcell") as HTMLButtonElement).onclick = loadCell;
   cellInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter") loadCell();
@@ -883,6 +914,18 @@ async function main() {
             (upstream ? " -- looks like the CAVE service is down; retry later" : "") +
             (detail ? `. Server said: ${detail}` : "")
           : `HTTP ${hr.status}${detail ? `: ${detail}` : ""}`,
+      );
+    }
+    // A root that has been edited since still works -- the skeleton AND the mask are both served
+    // as of when it existed -- but you're reviewing the cell as it WAS, which changes what your
+    // tags mean. Say it once, in the persistent notice rather than the status line that the next
+    // branch load overwrites. `false` specifically: null means we couldn't check.
+    const header = await hr.json().catch(() => null);
+    if (header && header.root_is_current === false) {
+      const when = header.root_timestamp ? String(header.root_timestamp).slice(0, 10) : "an earlier version";
+      showNotice(
+        `heads up: cell ${ROOT_ID} has been edited since ${when} -- showing the segmentation ` +
+          `as it was then, which is what this id refers to`,
       );
     }
   } catch (e) {

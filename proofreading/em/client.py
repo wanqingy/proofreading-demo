@@ -40,7 +40,10 @@ class EMClient:
         self._seg = None
         self._res = None
         self._img_cvs: dict = {}  # mip -> image CloudVolume
-        self._agg_cvs: dict = {}  # mip -> agglomerated segmentation CloudVolume
+        # (mip, timestamp) -> agglomerated segmentation CloudVolume. Keyed on the TIMESTAMP too:
+        # the same mip agglomerated at two different times is two different volumes, and caching
+        # them under one key would hand back whichever was built first.
+        self._agg_cvs: dict = {}
 
     @property
     def mat_version(self) -> int:
@@ -63,20 +66,51 @@ class EMClient:
         _ = self.seg
         return self._res
 
-    def agg_seg_cv(self, mip: int = 0):
+    def agg_seg_cv(self, mip: int = 0, timestamp=None):
         """Agglomerated segmentation CloudVolume at ``mip`` (root ids, not supervoxels; cached).
 
         Used to build the per-branch target mask for the local fly-through preview
         (``mask = cutout == root_id``). Distinct from :attr:`seg` (agglomerate=False).
+
+        ``timestamp`` pins WHEN the agglomeration is evaluated. Without it the chunkedgraph
+        agglomerates supervoxels to their **current** roots, which silently breaks the mask for
+        any root that is no longer current: the skeleton service happily serves a historical root,
+        so the fly-through looks perfect while ``cutout == root_id`` matches zero voxels and the
+        overlay is invisible. Observed on 864691135572519149 -- created 2024-10-23, since split
+        into 165 roots -- where all 174 mask chunks came out empty. Pass the root's own creation
+        time (see :meth:`root_timestamp`) and the comparison lines up again. Measured to cost
+        nothing: 5285 ms vs 5222 ms per 64^3 cutout.
         """
         mip = int(mip)
-        cv = self._agg_cvs.get(mip)
+        key = (mip, timestamp)
+        cv = self._agg_cvs.get(key)
         if cv is None:
-            cv = self.client.info.segmentation_cloudvolume(
-                agglomerate=True, mip=mip, progress=False
-            )
-            self._agg_cvs[mip] = cv
+            kw = {"agglomerate": True, "mip": mip, "progress": False}
+            if timestamp is not None:
+                kw["timestamp"] = timestamp
+            cv = self.client.info.segmentation_cloudvolume(**kw)
+            self._agg_cvs[key] = cv
         return cv
+
+    def root_timestamp(self, root_id: int):
+        """When ``root_id`` came into existence, or None if that can't be determined.
+
+        This is the right moment at which to agglomerate for that root, whether or not it is still
+        current -- a root stops being current precisely BECAUSE an edit produced a new one, so
+        "still current" means "nothing has changed since it was created". One rule covers both.
+        """
+        try:
+            ts = self.client.chunkedgraph.get_root_timestamps([int(root_id)])
+        except Exception:
+            return None  # never block a session on this; the caller falls back to live agglomeration
+        return ts[0] if len(ts) else None
+
+    def is_current_root(self, root_id: int) -> Optional[bool]:
+        """Whether ``root_id`` is still a leaf of the chunkedgraph (None if it can't be checked)."""
+        try:
+            return bool(self.client.chunkedgraph.is_latest_roots([int(root_id)])[0])
+        except Exception:
+            return None
 
     def image_cloudvolume(self, mip: int = 0):
         """EM image CloudVolume at ``mip`` (cached per mip).
