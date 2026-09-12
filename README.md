@@ -107,7 +107,11 @@ segment, type your name once (remembered per browser), and hit **Record**. The d
 the bottom lists everything recorded so far — **open** (view read-only, new tab), **edit**
 (reopen in this tab to update it in place), **del** (delete). Recording a segment already
 owned by a different neurite prompts for confirmation (shared segment vs. mistake) instead
-of silently overwriting.
+of silently overwriting. **show all** opens a new tab with every recorded segment
+selected and everything else left faintly visible (`notSelectedAlpha`) — there's no declared
+list of target segments to check off, so this is the aggregate view rather than a checklist,
+but what's *not* lit up is what's still unclaimed. The link is also shown in a small popover
+for copying.
 
 **If the data source needs Google auth your own OAuth client can't get** (e.g. a Brainmaps
 volume gated to a specific allowlist of client apps): use

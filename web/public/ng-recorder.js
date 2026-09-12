@@ -60,6 +60,16 @@
       border-radius:5px; padding:4px 6px; font:inherit; font-size:11px; }
     #ng-recorder-select:disabled { opacity:.5; }
     #ng-recorder-neurites button[data-action="delete"] { color:#ff8a8a; }
+    #ng-recorder-showallpanel { display:none; position:fixed; right:10px; bottom:52px; z-index:2147483647;
+      background:rgba(0,0,0,0.9); color:#7f8db0; border:1px solid #2c3a5a; border-radius:8px;
+      padding:10px 12px; font-size:11px; line-height:1.5; width:340px;
+      font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+    #ng-recorder-showallpanel.shown { display:block; }
+    #ng-recorder-showallcount { color:#8aff9c; margin-bottom:6px; }
+    #ng-recorder-showalllink { user-select:text; color:#d7e3ff; overflow-wrap:anywhere; max-height:30vh;
+      overflow-y:auto; border-top:1px solid #2c3a5a; border-bottom:1px solid #2c3a5a; padding:6px 0;
+      margin-bottom:6px; }
+    #ng-recorder-showallfoot { display:flex; gap:6px; justify-content:flex-end; }
   `;
   document.head.appendChild(style);
 
@@ -77,9 +87,22 @@
       <button id="ng-recorder-open" data-action="open" title="open in new tab">open</button>
       <button id="ng-recorder-edit" data-action="edit" title="edit in this tab">edit</button>
       <button id="ng-recorder-delete" data-action="delete" title="delete">del</button>
+      <button id="ng-recorder-showall" title="open a NG view with every recorded segment highlighted" disabled>show all</button>
     </div>
   `;
   document.body.appendChild(hud);
+
+  const showallPanel = document.createElement("div");
+  showallPanel.id = "ng-recorder-showallpanel";
+  showallPanel.innerHTML = `
+    <div id="ng-recorder-showallcount"></div>
+    <div id="ng-recorder-showalllink"></div>
+    <div id="ng-recorder-showallfoot">
+      <button id="ng-recorder-showallcopy" title="copy this link">copy link</button>
+      <button id="ng-recorder-showallreopen" title="open in new tab">open &#8599;</button>
+    </div>
+  `;
+  document.body.appendChild(showallPanel);
 
   const $ = (id) => document.getElementById(id);
   const setStatus = (msg, cls) => {
@@ -119,7 +142,9 @@
   }
 
   function captureNotesBySegment(annLayers) {
-    const notes = {};
+    // a segment can be linked from more than one annotation point (across layers too) --
+    // concatenate all their notes instead of the last one silently clobbering the rest.
+    const bySeg = {};
     for (const layer of annLayers) {
       const src = layer.localAnnotations;
       if (!src) continue;
@@ -128,9 +153,14 @@
         if (!desc) continue;
         const related = ann.relatedSegments;
         if (!related || !related.length) continue;
-        for (const segId of related[0]) notes[segId.toString()] = desc;
+        for (const segId of related[0]) {
+          const key = segId.toString();
+          (bySeg[key] || (bySeg[key] = [])).push(desc);
+        }
       }
     }
+    const notes = {};
+    for (const [seg, list] of Object.entries(bySeg)) notes[seg] = list.join("; ");
     return notes;
   }
 
@@ -140,8 +170,9 @@
     return encodeURI(fragment).replace(/[!'()*;,]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase());
   }
 
-  function buildLink() {
+  function buildLink(mutate) {
     const json = viewer.state.toJSON();
+    if (mutate) mutate(json);
     const str = JSON.stringify(json, (_k, v) => (typeof v === "bigint" ? v.toString() : v));
     const frag = encodeFragment(str);
     return `${location.origin}${location.pathname}${location.search}#!${frag}`;
@@ -208,6 +239,9 @@
   }
 
   let neuriteMap = {};
+  // whether the last refreshList() actually succeeded -- so showAll() never opens a link that
+  // (falsely) highlights nothing just because the backend happened to be down.
+  let neuritesLoaded = false;
 
   function selectedNeuriteId() {
     const sel = $("ng-recorder-select");
@@ -222,10 +256,11 @@
     const openBtn = $("ng-recorder-open");
     const editBtn = $("ng-recorder-edit");
     const delBtn = $("ng-recorder-delete");
+    const showAllBtn = $("ng-recorder-showall");
     if (!items.length) {
       sel.innerHTML = "<option>no neurites recorded yet</option>";
       sel.disabled = true;
-      openBtn.disabled = editBtn.disabled = delBtn.disabled = true;
+      openBtn.disabled = editBtn.disabled = delBtn.disabled = showAllBtn.disabled = true;
       return;
     }
     sel.innerHTML = items
@@ -235,7 +270,7 @@
       )
       .join("");
     sel.disabled = false;
-    openBtn.disabled = editBtn.disabled = delBtn.disabled = false;
+    openBtn.disabled = editBtn.disabled = delBtn.disabled = showAllBtn.disabled = false;
     if (prev && items.some((n) => String(n.id) === prev)) sel.value = prev;
   }
 
@@ -294,9 +329,89 @@
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const data = await r.json();
       renderList(data.neurites || []);
+      neuritesLoaded = true;
     } catch (e) {
+      neuritesLoaded = false;
+      setStatus("FAIL: neurite list unavailable -- backend down?", "warn");
       console.warn("[ng-recorder] refreshList failed", e);
     }
+  }
+
+  // --- "show all": one NG view with every recorded segment highlighted ---
+  //
+  // No new endpoint and no extra fetch: GET /api/neurites already returns the full
+  // seg_id -> note map per neurite, so neuriteMap holds everything already.
+  //
+  // There is no declared list of TARGET segment ids in this repo, so "not annotated yet"
+  // has no universe to diff against as a list. The viewer answers it instead: every
+  // recorded segment selected (bright), everything else left unselected but faintly
+  // visible via notSelectedAlpha -- the contrast IS the answer. No findLayers() duck-typing
+  // needed here (unlike captureVisibleSegments) -- the state-JSON walk keys off
+  // type === "segmentation", which is already name-agnostic.
+
+  // seg ids are decimal uint64 strings -- up to 20 digits, so Number(a) - Number(b) loses
+  // precision past 2^53, and a bare .sort() puts "10149" before "1041". Non-negative decimals
+  // with no leading zeros order correctly by (digit count, then lexicographic).
+  const bySegId = (a, b) => a.length - b.length || (a < b ? -1 : a > b ? 1 : 0);
+
+  // dedupe across neurites: a cross-neurite conflict resolved "keep" is recorded under BOTH
+  // (proofreading/annotate/api.py), so summing seg_count over-counts -- this is the distinct set.
+  function allRecordedIds() {
+    const ids = new Set();
+    for (const n of Object.values(neuriteMap)) {
+      for (const seg of Object.keys(n.ids || {})) ids.add(seg);
+    }
+    return [...ids].sort(bySegId);
+  }
+
+  function buildShowAllLink(ids) {
+    return buildLink((state) => {
+      for (const layer of state.layers || []) {
+        if (layer.type !== "segmentation") continue;
+        layer.segments = ids; // plain (unprefixed) ids -- "!"-prefixed means HIDDEN, not this
+        // notSelectedAlpha defaults to 0 (fully invisible) -- floor it so unrecorded segments
+        // are faintly visible instead of just black. Floor, don't overwrite: never dims a
+        // higher value the user already had.
+        layer.notSelectedAlpha = Math.max(layer.notSelectedAlpha ?? 0, 0.15);
+      }
+    });
+  }
+
+  function showAll() {
+    if (!neuritesLoaded) {
+      setStatus("FAIL: can't show all -- neurite list hasn't loaded (backend down?)", "warn");
+      return;
+    }
+    const ids = allRecordedIds();
+    if (!ids.length) {
+      setStatus("no neurites recorded yet", "warn");
+      return;
+    }
+    const link = buildShowAllLink(ids);
+    window.open(link, "_blank", "noopener"); // new tab -- never touches this page's own selection
+    $("ng-recorder-showallcount").textContent =
+      `${ids.length} segment${ids.length === 1 ? "" : "s"} across ${Object.keys(neuriteMap).length} neurite${Object.keys(neuriteMap).length === 1 ? "" : "s"}`;
+    $("ng-recorder-showalllink").textContent = link;
+    showallPanel.classList.add("shown");
+  }
+
+  async function copyShowAllLink() {
+    const link = $("ng-recorder-showalllink").textContent || "";
+    if (!link) return;
+    try {
+      // a programmatic clipboard write, NOT a synthetic "copy" event -- neuroglancer's own
+      // document-level copy handler replaces the clipboard with the whole viewer-state JSON
+      // unless a real text Range is already selected.
+      await navigator.clipboard.writeText(link);
+      setStatus("OK: copied link", "ok");
+    } catch (e) {
+      setStatus(`FAIL: copy failed: ${e}`, "warn");
+    }
+  }
+
+  function reopenShowAllLink() {
+    const link = $("ng-recorder-showalllink").textContent || "";
+    if (link) window.open(link, "_blank", "noopener");
   }
 
   const userInput = $("ng-recorder-user");
@@ -308,6 +423,9 @@
   $("ng-recorder-open").onclick = openSelected;
   $("ng-recorder-edit").onclick = editSelected;
   $("ng-recorder-delete").onclick = deleteSelected;
+  $("ng-recorder-showall").onclick = showAll;
+  $("ng-recorder-showallcopy").onclick = copyShowAllLink;
+  $("ng-recorder-showallreopen").onclick = reopenShowAllLink;
 
   const params = new URLSearchParams(location.search);
   const editParam = params.get("__ngRecorderEdit");

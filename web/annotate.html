@@ -158,6 +158,51 @@
       #legend.shown {
         display: block;
       }
+      /* show-all popover: same idiom as #legend, anchored right (legend is left) since it's
+         about everything recorded rather than the "?" help text. Holds an encoded link
+         (~3KB), not prose, so it needs its own scroll + wrap rules -- body has overflow:hidden,
+         so anything taller than the viewport would otherwise be silently clipped. */
+      #showallpanel {
+        display: none;
+        position: absolute;
+        right: 0;
+        bottom: 42px;
+        z-index: 10001;
+        background: rgba(0, 0, 0, 0.9);
+        color: #7f8db0;
+        border: 1px solid #2c3a5a;
+        border-radius: 8px;
+        padding: 10px 12px;
+        font-size: 11px;
+        line-height: 1.5;
+        width: 340px;
+      }
+      #showallpanel.shown {
+        display: block;
+      }
+      #showallcount {
+        color: #8aff9c;
+        margin-bottom: 6px;
+      }
+      #showalllink {
+        /* the one thing in this popover you DO want to drag-select -- #hud sets
+           user-select:none for the whole bar, inherited by popover children by default, and
+           neuroglancer's own copy handler only defers to a real text Range. */
+        user-select: text;
+        color: #d7e3ff;
+        overflow-wrap: anywhere;
+        max-height: 30vh;
+        overflow-y: auto;
+        border-top: 1px solid #2c3a5a;
+        border-bottom: 1px solid #2c3a5a;
+        padding: 6px 0;
+        margin-bottom: 6px;
+      }
+      #showallfoot {
+        display: flex;
+        gap: 6px;
+        justify-content: flex-end;
+      }
     </style>
   </head>
   <body>
@@ -188,6 +233,15 @@
         <button id="neuriteopen" title="open in new tab">open</button>
         <button id="neuriteedit" title="edit in this tab">edit</button>
         <button id="neuritedelete" data-action="delete" title="delete">del</button>
+        <button id="showall" title="open a NG view with every recorded segment highlighted" disabled>show all</button>
+      </div>
+      <div id="showallpanel">
+        <div id="showallcount"></div>
+        <div id="showalllink"></div>
+        <div id="showallfoot">
+          <button id="showallcopy" title="copy this link">copy link</button>
+          <button id="showallreopen" title="open in new tab">open ↗</button>
+        </div>
       </div>
     </div>
     <script>

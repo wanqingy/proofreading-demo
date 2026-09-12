@@ -104,6 +104,7 @@ function addAnnotationLayer() {
 
 // --- capture: read visible segments + per-segment notes off the live viewer state ---
 function captureVisibleSegments(): string[] {
+  if (!viewer) return []; // handlers are wired in main() before setupViewer() runs
   const layer: any = viewer.layerManager.getLayerByName(SEG_LAYER);
   const visible = layer?.layer?.displayState?.segmentationGroupState?.value?.visibleSegments;
   if (!visible) return [];
@@ -114,16 +115,22 @@ function captureNotesBySegment(): Record<string, string> {
   const layer: any = viewer.layerManager.getLayerByName(ANN_LAYER);
   const src = layer?.layer?.localAnnotations;
   if (!src) return {};
-  const notes: Record<string, string> = {};
+  // a segment can be linked from more than one annotation point -- concatenate all their
+  // notes instead of the last one silently clobbering the rest (localAnnotations iterates
+  // insertion order, so "last" here meant "most recently added", not "most important").
+  const bySeg: Record<string, string[]> = {};
   for (const ann of src) {
     const desc = ann.description;
     if (!desc) continue;
     const related = ann.relatedSegments as BigUint64Array[] | undefined;
     if (!related || !related.length) continue;
     for (const segId of related[0]) {
-      notes[segId.toString()] = desc;
+      const key = segId.toString();
+      (bySeg[key] ??= []).push(desc);
     }
   }
+  const notes: Record<string, string> = {};
+  for (const [seg, list] of Object.entries(bySeg)) notes[seg] = list.join("; ");
   return notes;
 }
 
@@ -133,8 +140,9 @@ function encodeFragment(fragment: string): string {
   return encodeURI(fragment).replace(/[!'()*;,]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase());
 }
 
-function buildLink(): string {
+function buildLink(mutate?: (state: any) => void): string {
   const json = viewer.state.toJSON();
+  if (mutate) mutate(json);
   const str = JSON.stringify(json, (_key, value) => (typeof value === "bigint" ? value.toString() : value));
   const frag = encodeFragment(str);
   return `${location.origin}${location.pathname}${location.search}#!${frag}`;
@@ -222,6 +230,7 @@ async function recordNeurite() {
 interface NeuriteSummary {
   id: number;
   link: string;
+  ids: Record<string, string>; // seg_id -> note; already in GET /api/neurites (see api.py)
   seg_count: number;
   note_count: number;
   ts: string;
@@ -229,6 +238,10 @@ interface NeuriteSummary {
 }
 
 let neuriteMap: Record<number, NeuriteSummary> = {};
+// whether the last refreshNeuriteList() actually succeeded -- distinguishes "backend confirms
+// nothing recorded yet" from "backend unreachable", which matters for showAll(): the latter must
+// never open a link that (falsely) highlights nothing.
+let neuritesLoaded = false;
 
 function selectedNeuriteId(): number | null {
   const sel = $("neuriteselect") as HTMLSelectElement;
@@ -244,11 +257,12 @@ function renderNeuriteList(items: NeuriteSummary[]) {
   const openBtn = $("neuriteopen") as HTMLButtonElement;
   const editBtn = $("neuriteedit") as HTMLButtonElement;
   const delBtn = $("neuritedelete") as HTMLButtonElement;
+  const showAllBtn = $("showall") as HTMLButtonElement;
 
   if (!items.length) {
     sel.innerHTML = `<option>no neurites recorded yet</option>`;
     sel.disabled = true;
-    openBtn.disabled = editBtn.disabled = delBtn.disabled = true;
+    openBtn.disabled = editBtn.disabled = delBtn.disabled = showAllBtn.disabled = true;
     return;
   }
   // most recently recorded first (backend already returns this order)
@@ -259,7 +273,7 @@ function renderNeuriteList(items: NeuriteSummary[]) {
     )
     .join("");
   sel.disabled = false;
-  openBtn.disabled = editBtn.disabled = delBtn.disabled = false;
+  openBtn.disabled = editBtn.disabled = delBtn.disabled = showAllBtn.disabled = false;
   if (prev && items.some((n) => String(n.id) === prev)) sel.value = prev;
 }
 
@@ -310,9 +324,93 @@ async function refreshNeuriteList() {
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const data = await r.json();
     renderNeuriteList(data.neurites || []);
+    neuritesLoaded = true;
   } catch (e) {
+    neuritesLoaded = false;
+    status("✗ neurite list unavailable — backend down?", "warn");
     console.warn("[annotate] refreshNeuriteList failed", e);
   }
+}
+
+// --- "show all": one NG view with every recorded segment highlighted ---
+//
+// No new endpoint and no extra fetch: GET /api/neurites already returns the full
+// seg_id -> note map per neurite (neurite_summary in proofreading/annotate/api.py),
+// so neuriteMap holds everything already.
+//
+// There is no declared list of TARGET segment ids in this repo, so "not annotated yet"
+// has no universe to diff against as a list. The viewer answers it instead: every
+// recorded segment selected (bright), everything else left unselected but faintly
+// visible via notSelectedAlpha -- the contrast IS the answer.
+
+// seg ids are decimal uint64 strings -- up to 20 digits, so Number(a) - Number(b) loses
+// precision past 2^53, and a bare .sort() puts "10149" before "1041". Non-negative decimals
+// with no leading zeros order correctly by (digit count, then lexicographic).
+const bySegId = (a: string, b: string) => a.length - b.length || (a < b ? -1 : a > b ? 1 : 0);
+
+// dedupe across neurites: a cross-neurite conflict resolved "keep" is recorded under BOTH
+// (api.py), so summing seg_count over-counts -- this is the distinct set.
+function allRecordedIds(): string[] {
+  const ids = new Set<string>();
+  for (const n of Object.values(neuriteMap)) {
+    for (const seg of Object.keys(n.ids || {})) ids.add(seg);
+  }
+  return [...ids].sort(bySegId);
+}
+
+function buildShowAllLink(ids: string[]): string {
+  return buildLink((state) => {
+    for (const layer of state.layers || []) {
+      if (layer.type !== "segmentation") continue;
+      layer.segments = ids; // plain (unprefixed) ids -- "!"-prefixed means HIDDEN, not this
+      // notSelectedAlpha defaults to 0 (fully invisible) -- floor it so unrecorded segments
+      // are faintly visible instead of just black. Floor, don't overwrite: never dims a
+      // higher value the user already had.
+      layer.notSelectedAlpha = Math.max(layer.notSelectedAlpha ?? 0, 0.15);
+    }
+  });
+}
+
+function showAll() {
+  if (!neuritesLoaded) {
+    status("✗ can't show all — neurite list hasn't loaded (backend down?)", "warn");
+    return;
+  }
+  const ids = allRecordedIds();
+  if (!ids.length) {
+    status("no neurites recorded yet", "warn");
+    return;
+  }
+  const link = buildShowAllLink(ids);
+  window.open(link, "_blank", "noopener"); // new tab -- never touches this tab's in-progress selection
+  $("showallcount").textContent = `${ids.length} segment${ids.length === 1 ? "" : "s"} across ${Object.keys(neuriteMap).length} neurite${Object.keys(neuriteMap).length === 1 ? "" : "s"}`;
+  ($("showalllink") as HTMLElement).textContent = link;
+  showPopover("showallpanel");
+}
+
+async function copyShowAllLink() {
+  const link = ($("showalllink") as HTMLElement).textContent || "";
+  if (!link) return;
+  try {
+    // a programmatic clipboard write, NOT a synthetic "copy" event -- neuroglancer's own
+    // document-level copy handler (ui/default_clipboard_handling.js) replaces the clipboard
+    // with the whole viewer-state JSON unless a real text Range is already selected.
+    await navigator.clipboard.writeText(link);
+    status("✓ copied link", "ok");
+  } catch (e) {
+    status(`✗ copy failed: ${e}`, "warn");
+  }
+}
+
+function reopenShowAllLink() {
+  const link = ($("showalllink") as HTMLElement).textContent || "";
+  if (link) window.open(link, "_blank", "noopener");
+}
+
+// #legend and #showallpanel share the same slot above the bar -- mutually exclusive.
+function showPopover(which: "legend" | "showallpanel" | null) {
+  $("legend").classList.toggle("shown", which === "legend");
+  $("showallpanel").classList.toggle("shown", which === "showallpanel");
 }
 
 async function main() {
@@ -321,7 +419,8 @@ async function main() {
   userInput.addEventListener("change", () => setUser(userInput.value.trim()));
 
   ($("record") as HTMLButtonElement).onclick = () => recordNeurite();
-  ($("help") as HTMLButtonElement).onclick = () => $("legend").classList.toggle("shown");
+  ($("help") as HTMLButtonElement).onclick = () =>
+    showPopover($("legend").classList.contains("shown") ? null : "legend");
   ($("canceledit") as HTMLButtonElement).onclick = () => {
     setEditing(null);
     clearEditParam();
@@ -329,6 +428,9 @@ async function main() {
   ($("neuriteopen") as HTMLButtonElement).onclick = openSelected;
   ($("neuriteedit") as HTMLButtonElement).onclick = editSelected;
   ($("neuritedelete") as HTMLButtonElement).onclick = deleteSelected;
+  ($("showall") as HTMLButtonElement).onclick = showAll;
+  ($("showallcopy") as HTMLButtonElement).onclick = copyShowAllLink;
+  ($("showallreopen") as HTMLButtonElement).onclick = reopenShowAllLink;
 
   const editParam = params.get("edit");
   if (editParam) setEditing(parseInt(editParam, 10));
